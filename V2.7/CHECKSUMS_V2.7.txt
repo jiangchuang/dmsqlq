@@ -1,0 +1,5 @@
+bd1623200d87d3aec0524606a3305fda *dmsqlq.exe
+544207aa751e54df959f40a62c231c9e *dmsqlq_linux_x64
+a00b34d9a6fed2fd7b005b2c5459d6d5 *dmsqlq_linux_arm64
+4551494324dd1f0a0d54e81f79991ac6 *使用说明.md
+0926ef12859e89a6a350bd3fce0235f4 *CHANGELOG.md

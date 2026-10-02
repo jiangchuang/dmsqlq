@@ -1,0 +1,11 @@
+# 仓库内统一 LF，避免跨平台换行差异
+* text=auto eol=lf
+
+# 二进制：不做任何换行转换
+*.exe binary
+*.zip binary
+*.xlsx binary
+
+# 🩸 CHECKSUMS 必须保持 LF
+# 若被转成 CRLF，md5sum -c 会把行尾的 \r 算进文件名，导致全部校验 FAILED open or read
+CHECKSUMS_*.txt text eol=lf

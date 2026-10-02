@@ -1,0 +1,17 @@
+# 操作系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 工具生成物（默认命名的报告与附件，不想入库）
+*_报告.html
+*_交付.xlsx
+*.full.sql
+
+# 压缩包（版本目录已含二进制，zip 属冗余）
+*.zip
