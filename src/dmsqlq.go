@@ -25,6 +25,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -43,7 +44,7 @@ const (
 	// 🩸 必须给 gzip.NewReader 套 bufio：
 	// flate 默认每次只向底层要 512B，107GB 会触发约 2 亿次
 	// syscall，实测把 5.44GB tgz 的解压从 60s 拖到 162s（2.7x）。
-	ver          = "2.7"
+	ver          = "2.22"
 	reportTopMax = 20      // 报告里各排行榜的显示上限（-p 更大时也只显示这么多）
 	adviceLimit  = 8       // 「优先优化推荐」条数上限（推荐要精不要多，8 条足够排完收益）
 	maxKeys      = 1 << 18 // 参数缓存键上限（防大日志吃内存）
@@ -141,6 +142,21 @@ func (o *Options) rowCap() int {
 	return o.top
 }
 
+// lockKeepCap 锁等待明细的保留上限（V2.8 起与显示上限解耦）。
+//
+// 🩸 与「最慢语句」不同：锁等待天然稀疏（实测 1 GB 现网日志仅 120 次），
+// 但每一条都是能单独动手的线索，而且用户明确要「双方 SQL 覆盖全部等待」。
+// 早先沿用 rowCap()（= -p，默认 20），等于报告只覆盖了 1/6 的锁等待 ——
+// 更糟的是统计句里用截断后的值当分母，会写出「20/20 但没有一条 SQL」这种自相矛盾的话。
+// 5000 条足够覆盖任何真实锁竞争场面，同时给病态日志留了内存上限。
+func lockKeepCap(o *Options) int {
+	const n = 5000
+	if o.rowCap() > n {
+		return o.rowCap()
+	}
+	return n
+}
+
 // excelWanted 本次是否要产出 Excel 交付件（-e，或 -r 落到 .xlsx）。
 // 「要不要刷 SQL」「要不要打简要版」两处都靠它判断 —— 集中一处，免得规则打架。
 func (o *Options) excelWanted() bool {
@@ -179,6 +195,12 @@ func usage(fs *flag.FlagSet) func() {
   5) dmsqlq . -B 20 -o slow.sql   导出最慢 20 条的完整 SQL
   6) dmsqlq x.log -x 10130765548  按事务号抽一条事务的全部语句（问题复现）
   7) dmsqlq . -e 交付.xlsx       出一份 Excel 交付件（定期交付给开发商做 SQL 优化）
+
+  实时监视（独立子命令，与上面的批处理模式互不影响）
+  8) dmsqlq watch -a manager.exe      （日志目录会自动找，不用记路径）
+                                  实时跟随 SQL 日志，打印指定客户端执行的 SQL。
+                                  想知道「点一下 DM 管理工具，它到底跑了什么 SQL」就用它。
+                                  参数与上面完全不同，看 dmsqlq watch -h。
 
 选项（每个都有短写与长写；大写多是同类里的“增强/反向”，方便记）
   筛选
@@ -265,6 +287,17 @@ func usage(fs *flag.FlagSet) func() {
     -Q, --no-open       生成 HTML 报告后**不要**自动打开浏览器
                         （默认会自动打开；批处理里连跑多份日志时用这个关掉）
     -h, --help          显示本帮助              -V, --version  显示版本
+
+TAB 补全（bash/zsh；首次以交互方式运行 dmsqlq 时自动安装，无需手工执行）
+  自动: 首次交互运行即装好（提示走 stderr，不污染管道；只触发一次）
+  手工: dmsqlq --completion-install        # 显式安装（幂等，可重复执行）
+        dmsqlq --completion-install-dry-run # 只预览将做什么，不写盘
+        dmsqlq --completion-uninstall      # 撤销（幂等）
+        dmsqlq --completion-bash           # 只打印补全脚本（供 source <(...) 用）
+  装后: dmsqlq -<TAB> → 全部选项 · dmsqlq watch -<TAB> → watch 专属选项
+        位置参数（日志文件/目录）自动补文件名
+  机制: 与 dmkit 一致 —— 写 ~/.dmsqlq/completion.bash + 在 ~/.bashrc 维护带标记的
+        自动同步区块（二进制更新后新终端自动刷新；幂等，不产生重复配置）
 
 输出长这样（每条语句之间空一行；-N 去掉注释头后是纯 SQL）
   -- 2026-09-09 23:52:51 · [INS] · 0ms · 1行 · COSMIC_FI · trxid:10130765548 · KD1_20260909_235252
@@ -1274,6 +1307,27 @@ func (h *logHist) add(ms float64) {
 	h.b[i]++
 }
 
+// minApprox 用「最低非空桶的下沿」近似最小耗时（毫秒）。
+//
+// 桶按 10^(i/16) 分档（每档约 1.155 倍），所以误差 ≤15% —— 对它的用途完全够：
+// 判断「日志里最小 EXECTIME 是不是恰好卡在某个整数阈值上」，
+// 从而识别采集侧的 MIN_EXEC_TIME（低于该值的语句根本不写日志）。
+//
+// 🩸 刻意不新增热路径字段：整份日志的最小值要么在桶里推、要么就得在每个 SQL 事件上
+// 多写一个共享标量 —— 见「溯源缓冲别挂共享 Stats」那条教训（并发写共享字段会因
+// 缓存行争用拖慢扫描）。这里纯靠报告期已有的桶算，零采集开销。
+func (h *logHist) minApprox() float64 {
+	if h.zero > 0 {
+		return 0
+	}
+	for i := 0; i < lhBuckets; i++ {
+		if h.b[i] > 0 {
+			return math.Pow(10, float64(i)/16) / 1000 // µs → ms
+		}
+	}
+	return 0
+}
+
 // quantile 返回 p 分位耗时（毫秒）。p ∈ (0,1]
 func (h *logHist) quantile(p float64) float64 {
 	if h == nil || h.n == 0 {
@@ -1388,6 +1442,52 @@ type lockTableAgg struct {
 	MaxAt string          // 最长一次等待的时间
 }
 
+// trxStmtRec 一条归属到具体事务的语句（锁等待溯源用，V2.8）。
+//
+// 为什么按事务存语句：锁等待行只给「等待方 trxid / 持有方 trxid」，
+// 而现场真正想知道的是「到底哪条 SQL 在持锁、哪条 SQL 被卡住」。
+// 实测执行行带真实 trxid（非 0），据此可反查。
+//
+// 🩸 但不能假设一定查得到：语句文本的采集受掩码 2~17 控制，
+// 本批现网日志 80 次锁等待里只有 35% 的持有方能查到语句文本，
+// 其余只留下 `TRX: START` / `PARAMS` / `alloc pseg`。取不到时必须**显式说明**，
+// 而不是留空 —— 留空会被读成"这个事务没跑语句"，与"语句没记进日志"是两回事。
+//
+// 🩸 也**不能**改用语句句柄 `stmt:0x…` 关联：它是会话命令缓冲的地址，会被复用
+// （实测同一个句柄 6 分钟后挂到另一条完全不同的语句上），拿它当键必然串错。
+type trxStmtRec struct {
+	TrxID string
+	TS    string
+	Op    string
+	MS    float64
+	Rows  string
+	SQL   string
+}
+
+// trxEndRec 一次「带真实 trxid 的事务结束事件」（COMMIT / ROLLBACK）。
+type trxEndRec struct {
+	TrxID string
+	TS    string
+	Kind  string
+}
+
+// trxActivity 一个事务在日志里的可见活动（报告期按需归并出来的视图）。
+//
+// 🩸 采集期**不用** map[trxid]*trxActivity 逐事务建对象：现网执行行可达十万级，
+// 每个事务建一个结构体 + 一条切片，实测让 2.0 GB 的扫描从 2.28s 涨到 2.66s（+14%）。
+// 改成一根扁平数组追加（摊销 O(1)、无小对象），报告期只对**锁等待涉及的那几个
+// 事务**做一次归并 —— 锁等待是百级，归并代价可忽略。
+//
+// 🩸 这里也刻意**不**记「PARAMS 行数」：PARAMS 行百万级，两种记账方式
+// （string 键 / 零分配 uint64 键）都把扫描拖到 3.8~4.3s，不值得。
+// 「语句文本没采到」用 Stmts 是否为空即可判：有=采到了，空=没进日志。
+type trxActivity struct {
+	Kind      string // 最后一次事件：START / COMMIT / ROLLBACK
+	EndTS     string // 结束事件的时间（COMMIT/ROLLBACK 才有）
+	Stmts     []trxStmtRec
+	StmtTotal int64
+}
+
 // 锁等待行正则：锚点必须是 LOCK_TID + wait for 同时出现
 // （不能只匹配 LOCK_ —— 日志里 LOCK_R3 / LOCK_MONITOR 之类表名会造成大量误判）
 //
@@ -1465,11 +1565,21 @@ type Stats struct {
 	TrxUser    map[string]string  // trxid -> 该事务的用户（用于回答"谁在持锁"）
 	TrxExecMS  map[string]float64 // trxid -> 该事务内 SQL 累计执行耗时（算"事务利用率"用）
 	TrxFirstMS map[string]float64 // trxid -> 该事务第一条 SQL 的耗时（利用率分母的修正项）
-	trxFull    bool
-	Commits    int64     // TRX: COMMIT 次数
-	Rollbacks  int64     // TRX: ROLLBACK 次数
-	agg        bool      // 是否需要做完整聚合（未要统计报告时全跳过）
-	TopMSList  []topStmt // --top-ms 缓存
+	// 锁等待溯源（V2.8）：扁平追加存放，报告期只对锁等待涉及的事务做归并。
+	// 用扁平数组而不是 map[trxid]*trxActivity —— 后者每个事务一个对象 + 一条切片，
+	// 十万级执行行下实测让扫描慢 14%（详见 trxActivity 注释）。
+	trxStmts []trxStmtRec
+	trxEnds  []trxEndRec
+	trxFull  bool
+	// V2.12：掩码 27 的 [ORA] 行（(sess,thrd,stmt) 键 → 原始 SQL）与「事务号 → 语句键」。
+	// 二者配合，把"执行行被 MIN_EXEC_TIME 滤掉"的持有方 SQL 兜底找回来。
+	// 只有日志开了位 27 才非空；没开时全程 nil（零额外内存）。
+	oraSQL      map[uint64]string
+	oraKeyByTrx map[uint64]uint64
+	Commits     int64     // TRX: COMMIT 次数
+	Rollbacks   int64     // TRX: ROLLBACK 次数
+	agg         bool      // 是否需要做完整聚合（未要统计报告时全跳过）
+	TopMSList   []topStmt // --top-ms 缓存
 
 	// 锁（掩码 29）
 	LockN        int64
@@ -2172,6 +2282,24 @@ func (s *Stats) addTrxEvent(trxid, ts, kind string) {
 	s.touchTrxN(trxid, ts, kind, false)
 }
 
+// perTrxStmtCap 单个事务最多留存多少条语句（锁等待溯源）。
+// 8 条足够看清「这个事务在持锁期间干了什么」；再多也读不完，还占内存。
+const perTrxStmtCap = 8
+
+// maxTrxActStmt 全局最多留存多少条「事务 → 语句」记录。
+// 现网 execute 行通常稀疏（实测 1 GB 日志仅 1,332 条），但有的库会开满掩码，
+// 那时 execute 行可到百万级 —— 设上限，超了只计数不再留存。
+const maxTrxActStmt = 400000
+
+// maxTrxEndRec 全局最多留存多少条「事务结束事件」记录。
+// 现网 COMMIT/ROLLBACK 带真实 trxid 时可达百万级（本批 1008 日志 196 万条事务事件），
+// 全留会吃内存 —— 只保前 maxTrxEndRec 条。
+const maxTrxEndRec = 600000
+
+// maxOraTrxKey 「事务号 → 语句键」映射最多存多少条（V2.12）。
+// 只在 DLCK 行登记，量级 = 语句数（现网几十万）；设上限防极端日志把内存吃满。
+const maxOraTrxKey = 300000
+
 // addTrxEnd 记录事务结束事件（COMMIT / ROLLBACK）。
 // 这些行的 trxid 常为 0，归属不到具体事务，但**次数与时间点**足以算 TPS 与回滚率。
 func (s *Stats) addTrxEnd(ts, kind string) {
@@ -2415,6 +2543,21 @@ func (s *Stats) fillAuditSQL(idx int, sql []byte) {
 	}
 }
 
+// fillTrxStmtSQL 参数还原后回填锁溯源里那条语句（按 trxid + 时间戳定位）。
+//
+// 位置改为：先把索引记下来再按索引回填，避免线性查找。
+// 现在按「扁平数组 + 下标」实现（见 addTrxStmtLocked 的返回下标）。
+func (s *Stats) fillTrxStmtSQLAt(idx int, sql []byte) {
+	if idx < 0 || len(sql) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx < len(s.trxStmts) {
+		s.trxStmts[idx].SQL = sqlFull(sql)
+	}
+}
+
 // noteLSN 采样事务提交的 LSN：每 30 秒一桶。
 //
 // 用途是"恢复定位"：出了误删，DBA 需要知道出事前后最近的提交 LSN（配合归档日志做不完全恢复）。
@@ -2528,6 +2671,28 @@ func lockParty(trx, user string) string {
 		t = t[:14] + "…"
 	}
 	return "trx[" + t + "] " + user
+}
+
+// splitTrxList 把日志里的持有方列表拆成事务号切片（保序）。
+//
+// 🩸 顺序有意义：清单是**累计排队**的，第一个才是真正持锁的事务，
+// 后面那些是排在它身后的等待者（现网实测最长排到 18 个）。
+// 所以"谁在持锁"永远取 [0]，不能把整条链都当成持有方。
+// 日志在队列过长时会写成 `..., ...more]`，那种占位符要丢掉。
+func splitTrxList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || strings.HasPrefix(p, "...") {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // lockTraceCmd 该次锁等待的溯源命令（复制即可看等待方当时在跑什么 SQL）
@@ -2788,6 +2953,130 @@ type parser struct {
 	buf  bytes.Buffer // 输出缓冲
 	file string
 	line int64
+
+	// 锁等待溯源缓冲（V2.8）。🩸 刻意放在 parser 上而不是 Stats 上：
+	// parser 是「一个文件一个」的，处理该文件时单线程，append 完全不需要加锁；
+	// 而写 Stats 上那份共享切片要在 s.mu 下由 6 个 goroutine 抢着改切片头，
+	// 实测让 2.0 GB 的扫描从 2.29s 退化到 2.71s（+18%）—— 纯粹是缓存行争用。
+	// 文件处理完（含提前结束）在 defer 里一次性并入 Stats。
+	trxStmts []trxStmtRec
+	trxEnds  []trxEndRec
+
+	// ---- V2.12：用掩码 27 的 [ORA] 行兜底补出「取不到的持有方 SQL」 ----
+	//
+	// 背景（133 构造实验实测）：`MIN_EXEC_TIME` **只过滤语句完成行（EXEC 行）**，
+	// 不过滤 PARAMS/DLCK/alloc pseg/TRX 行。所以一条很快（< MIN_EXEC_TIME）的
+	// INSERT/UPDATE，事务行都在、唯独没有 SQL 文本 —— 这就是现场"空壳事务"的成因。
+	//
+	// 而掩码 27（原始语句）的 `[ORA]: <SQL>` 行**不受 MIN_EXEC_TIME 影响**：
+	// 实测 0.4ms 的 UPDATE 照样有 [ORA] 行。它虽不带 trxid（恒为 0），
+	// 但带 sess + stmt 句柄 —— 而持有方事务的 PARAMS/DLCK 行带同样的 (sess, stmt)。
+	// 于是可以用「(sess,stmt) → SQL」把 SQL 找回来。
+	//
+	// 🩸 为什么用 p.key(sess)（= sess|thrd|stmt 的混合哈希）当键：
+	// 它就是参数还原用的那把键，不额外引入新的关联口径。
+	oraSQL map[uint64]string
+	// oraKeyByTrx 事务号(十进制→uint64) → 语句键。只在 **DLCK 行** 登记：
+	// DLCK 是语句级的（与语句数同量级），而 PARAMS 是百万级 —— 挂 PARAMS 会把
+	// 2GB 扫描从 2.1s 拖到 3.8s（见本文件上方 PARAMS 记账的教训）。
+	oraKeyByTrx map[uint64]uint64
+}
+
+// addTrxStmt 记录「本文件里某事务执行了一条语句」。无锁（p 为单文件独占）。
+// 返回在 p.trxStmts 里的下标，供参数还原后回填可执行版本。
+func (p *parser) addTrxStmt(trxid, ts, op string, ms float64, rows string, sql []byte) int {
+	if len(p.trxStmts) >= maxTrxActStmt {
+		return -1
+	}
+	p.trxStmts = append(p.trxStmts, trxStmtRec{
+		TrxID: trxid, TS: ts, Op: op, MS: ms, Rows: rows, SQL: string(sql)})
+	return len(p.trxStmts) - 1
+}
+
+// fillTrxStmtSQLAt 参数还原后把那条记录换成可执行版本。无锁（同 addTrxStmt）。
+func (p *parser) fillTrxStmtSQLAt(idx int, sql []byte) {
+	if idx < 0 || idx >= len(p.trxStmts) || len(sql) == 0 {
+		return
+	}
+	p.trxStmts[idx].SQL = sqlFull(sql)
+}
+
+// noteTrxEnd 记录带真实 trxid 的事务结束事件。无锁（同 addTrxStmt）。
+func (p *parser) noteTrxEnd(trxid, ts, kind string) {
+	if len(p.trxEnds) >= maxTrxEndRec {
+		return
+	}
+	p.trxEnds = append(p.trxEnds, trxEndRec{TrxID: trxid, TS: ts, Kind: kind})
+}
+
+// mergeTrxTrace 把单个文件的溯源缓冲并入全局（文件结束时调用一次）。
+func (s *Stats) mergeTrxTrace(p *parser) {
+	if len(p.trxStmts) == 0 && len(p.trxEnds) == 0 &&
+		len(p.oraSQL) == 0 && len(p.oraKeyByTrx) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if room := maxTrxActStmt - len(s.trxStmts); room > 0 {
+		n := len(p.trxStmts)
+		if n > room {
+			n = room
+			s.trxFull = true
+		}
+		s.trxStmts = append(s.trxStmts, p.trxStmts[:n]...)
+	} else {
+		s.trxFull = true
+	}
+	if room := maxTrxEndRec - len(s.trxEnds); room > 0 {
+		n := len(p.trxEnds)
+		if n > room {
+			n = room
+		}
+		s.trxEnds = append(s.trxEnds, p.trxEnds[:n]...)
+	}
+	// V2.12：[ORA] 索引并入（只有日志开了掩码 27 才非空；没开时两个 map 全程 nil）。
+	if len(p.oraSQL) > 0 {
+		if s.oraSQL == nil {
+			s.oraSQL = make(map[uint64]string, len(p.oraSQL))
+		}
+		for k, v := range p.oraSQL {
+			if _, ok := s.oraSQL[k]; !ok {
+				s.oraSQL[k] = v
+			}
+		}
+	}
+	if len(p.oraKeyByTrx) > 0 {
+		if s.oraKeyByTrx == nil {
+			s.oraKeyByTrx = make(map[uint64]uint64, len(p.oraKeyByTrx))
+		}
+		for k, v := range p.oraKeyByTrx {
+			if _, ok := s.oraKeyByTrx[k]; !ok {
+				s.oraKeyByTrx[k] = v
+			}
+		}
+	}
+}
+
+// oraSQLOfTrx 从掩码 27 的 [ORA] 索引里取某事务的原始 SQL（V2.12）。
+//
+// 用途：语句执行很快（< MIN_EXEC_TIME）时**执行行不写日志**，于是"持有方 SQL 消失"，
+// 只留下 PARAMS + alloc pseg（现场称之为空壳事务）。而 [ORA] 行（原始语句）**不受该阈值影响**，
+// 靠 DLCK 行带下来的 (sess,thrd,stmt) 键就能把 SQL 归回这个事务。
+//
+// 返回空串 = 日志没开位 27，或该事务没能登记到语句键（此时按老口径"取不到"）。
+func (s *Stats) oraSQLOfTrx(trxid string) string {
+	if len(s.oraSQL) == 0 || len(s.oraKeyByTrx) == 0 {
+		return ""
+	}
+	t := decID(trxid)
+	if t == 0 {
+		return ""
+	}
+	k, ok := s.oraKeyByTrx[t]
+	if !ok {
+		return ""
+	}
+	return s.oraSQL[k]
 }
 
 type stmtInfo struct {
@@ -2927,6 +3216,20 @@ func (p *parser) handleRecord(rec []byte) {
 	}
 	sql := bytes.TrimRight(rest[sqlStart:sqlEnd], " \t\r")
 
+	// V2.12：[ORA] 行（掩码 27 = 原始语句）登记 (sess,thrd,stmt) → SQL，
+	// 供报告期兜底补出"被 MIN_EXEC_TIME 滤掉执行行"的持有方 SQL。
+	// 它 trxid 恒为 0（解析阶段事务还没开始，实测如此），只能靠这把键关联。
+	if op == "ORA" && p.st.agg && len(sql) > 0 {
+		if k := p.key(sess); k != 0 {
+			if p.oraSQL == nil {
+				p.oraSQL = make(map[uint64]string, 1024)
+			}
+			if _, ok := p.oraSQL[k]; !ok {
+				p.oraSQL[k] = string(sql)
+			}
+		}
+	}
+
 	atomic.AddInt64(&p.st.Exec, 1)
 
 	// ---- 排除（-E）：与 -k/-m/-u 等"输出筛选"不同，它表达的是"这类语句不是有效负载"，
@@ -2954,12 +3257,20 @@ func (p *parser) handleRecord(rec []byte) {
 	info.user = field(sess, "user:", "trxid:")
 	info.trxid = field(sess, "trxid:", "stmt:")
 	slowIdx, tplK, tplNew, needFill := -1, "", false, false
+	trxStmtIdx := -1
 	auditIdx := -1
 	if p.st.agg {
 		if errCode != "" {
 			p.st.noteErrCode(errCode, info.exeMS)
 		}
 		slowIdx, tplK, tplNew, needFill = p.st.addOp(op, info.user, clientOf(sess), info.trxid, info.ts, info.exeMS, info.rows, p.file, info.execID, sql)
+		// 锁等待溯源：把语句挂到它所属的事务上（掩码 29 的锁行只给 trxid、不给 SQL）。
+		// 写在 addOp 之外是刻意的 —— 缓冲在 parser 上（单文件独占），不需要 s.mu，
+		// 也就不会和 6 个 goroutine 抢共享切片头（那样实测慢 18%）。
+		// 先判 trxid 再取 string(sql)：实测 57% 的执行行 trxid 为 0，对它们做拷贝纯属浪费。
+		if info.trxid != "" && info.trxid != "0" && info.trxid != "NULL" {
+			trxStmtIdx = p.addTrxStmt(info.trxid, info.ts, op, info.exeMS, info.rows, sql)
+		}
 		if op == "DDL" {
 			// DDL 的"首词"分布 —— 很多库的 [DDL] 其实是 STAT（更新统计信息）或
 			// `create or replace index` 这类维护语句，不看清会误以为"业务在改表结构"。
@@ -3087,6 +3398,10 @@ func (p *parser) handleRecord(rec []byte) {
 	}
 	if auditIdx >= 0 {
 		p.st.fillAuditSQL(auditIdx, outSQL)
+	}
+	if trxStmtIdx >= 0 {
+		// 参数还原后把锁溯源里那条记录也换成可执行版本（与最慢语句/模板同一份文本）
+		p.fillTrxStmtSQLAt(trxStmtIdx, outSQL)
 	}
 
 	if o.maxSQL > 0 && len(outSQL) > o.maxSQL {
@@ -3325,6 +3640,11 @@ func (p *parser) handleParams(rest, sess []byte, off int) {
 		return
 	}
 	atomic.AddInt64(&p.st.ParamsN, 1)
+	// 🩸 这里**不**统计「该事务有多少条 PARAMS 行」。
+	// 试过两版：string 键（2.09s → 4.31s）、零分配 uint64 键（→ 3.77s）——
+	// PARAMS 行在现网是百万级，任何按行记账都会把这个工具 2 秒扫 2GB 的
+	// 卖点毁掉。而这点信息用已有数据就能表达：
+	// 事务表里没有它的语句行、却有事务事件 → 就是「语句文本未采集」。
 	body := rest[off+eq+1:]
 	cnt := countParams(body)
 	if cnt > 0 {
@@ -3367,6 +3687,11 @@ func (p *parser) handleNonSQLEvent(rec, rest, sess []byte) {
 					p.st.noteLSN(tsOf(rec), string(m[1]))
 				}
 				p.st.addTrxEnd(tsOf(rec), kind)
+				// 本批现网日志实测 COMMIT/ROLLBACK **带真实 trxid** —— 补记结束事件，
+				// 否则「持有方最后是提交还是回滚」永远显示不出来（trxid 为 0 时才真归属不到）
+				if trxid != "" && trxid != "0" && trxid != "NULL" {
+					p.noteTrxEnd(trxid, tsOf(rec), kind)
+				}
 			}
 			return
 		}
@@ -3377,6 +3702,20 @@ func (p *parser) handleNonSQLEvent(rec, rest, sess []byte) {
 	case 'D': // DLCK used time:N(us) —— 锁节点自身耗时，不是等待
 		if !bytes.HasPrefix(rest, []byte("DLCK used time:")) {
 			return
+		}
+		// V2.12：DLCK 行带**真实 trxid** + **stmt 句柄**，是登记「事务 → 语句键」最省成本的
+		// 位置（语句级，不是 PARAMS 那种百万级）。报告期用它把 [ORA] 行的 SQL 归回持有方。
+		if p.st.agg {
+			if trx := decID(field(sess, "trxid:", "stmt:")); trx != 0 {
+				if k := p.key(sess); k != 0 {
+					if p.oraKeyByTrx == nil {
+						p.oraKeyByTrx = make(map[uint64]uint64, 4096)
+					}
+					if len(p.oraKeyByTrx) < maxOraTrxKey {
+						p.oraKeyByTrx[trx] = k
+					}
+				}
+			}
 		}
 		if m := reDlck.FindSubmatch(rest); m != nil {
 			v, _ := strconv.ParseFloat(string(m[1]), 64)
@@ -3395,7 +3734,7 @@ func (p *parser) handleNonSQLEvent(rec, rest, sess []byte) {
 			return
 		}
 		if lk, ok := parseLockLine(rest, rec, sess, p.file); ok {
-			p.st.addLockWait(lk, p.opt.rowCap())
+			p.st.addLockWait(lk, lockKeepCap(p.opt))
 			return
 		}
 		p.st.addLockUnparsed() // 是锁行但三种格式都不认识 —— 留计数，方便发现新变体
@@ -3528,6 +3867,26 @@ var (
 	keyThrd = []byte("thrd:")
 	keyStmt = []byte("stmt:")
 )
+
+// decID 把十进制事务号解析成 uint64（0 = 无事务号 / 解析失败）。
+// 与 hexAt 分开：日志里 trxid 是十进制（如 391171），sess/stmt 才是十六进制。
+func decID(s string) uint64 {
+	if s == "" || s == "0" || s == "NULL" {
+		return 0
+	}
+	var v uint64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0
+		}
+		v = v*10 + uint64(c-'0')
+		if v > 1<<62 {
+			return 0
+		}
+	}
+	return v
+}
 
 // hexAt 从 p 起解析十六进制值（自动跳过 "0x"），零分配
 func hexAt(s []byte, p int) uint64 {
@@ -3664,8 +4023,7 @@ func field(sess []byte, a, b string) string {
 	return strings.TrimSpace(string(sess[i : i+j]))
 }
 
-// clientOf 从会话块里取客户端标识（appname + ip）。
-// 现场日志里 appname 经常是空的、只有 ip，所以两者组合起来才够用。
+// clientOf 从会话块里取客户端标识（appname + ip）。// 现场日志里 appname 经常是空的、只有 ip，所以两者组合起来才够用。
 func clientOf(sess []byte) string {
 	app := field(sess, "appname:", "ip:")
 	ip := field(sess, "ip:", ")") // IPv6 写法（::ffff:10.0.0.27）原样保留，不做归一化
@@ -4101,6 +4459,9 @@ func estTotal(compressedRead, fileSize, produced int64) int64 {
 func processStream(name string, r io.Reader, w io.Writer, opt *Options, st *Stats) error {
 	st.noteSource(name)
 	p := &parser{opt: opt, pc: newParamCache(), st: st, file: shortSrc(name)}
+	// 文件处理完（含提前结束/出错）把锁溯源缓冲并入全局。
+	// 用 defer 而不是写在末尾：processStream 有三处 return，漏一处就会丢这个文件的溯源。
+	defer st.mergeTrxTrace(p)
 	buf := make([]byte, chunkSize)
 	var cur []byte   // 当前记录（含续行）
 	var carry []byte // 跨读取块的残行
@@ -4287,14 +4648,378 @@ func walkDir(dir string, all bool, add func(string)) error {
 	})
 }
 
+// ---------------------------------------------------------------- shell 补全
+//
+// dmsqlq 是「选项驱动」（主命令） + 「watch 子命令」两种形态，补全需分派：
+//   dmsqlq <TAB>        → 主命令选项 + watch + 日志文件/目录
+//   dmsqlq watch <TAB>  → watch 专属选项 + 目录
+// 安装方式与 dmkit 对齐：写补全脚本 → rc 维护带标记的自动同步区块 → 标记文件，
+// 支持「首次运行一次性自动安装」。
+
+const (
+	dmCompMarkBegin = "# >>> dmsqlq completion >>>"
+	dmCompMarkEnd   = "# <<< dmsqlq completion <<<"
+)
+
+// dmCompMainFlags 主命令选项（与 parseArgs 注册保持一致）。
+var dmCompMainFlags = []string{
+	"-f", "--from", "-t", "--to", "-m", "--min-ms", "-M", "--max-ms",
+	"-k", "--op", "-E", "--exclude-op", "-K", "--all-ops", "-u", "--user",
+	"-x", "--trx", "-l", "--sql-like", "-n", "--limit", "-O", "--obj-map",
+	"-s", "--stats", "-S", "--stats-only", "-r", "--stats-out",
+	"-e", "--excel", "-p", "--top", "-F", "--full-sql",
+	"-o", "--out", "-B", "--top-ms", "-T", "--term", "-N", "--no-meta",
+	"-P", "--no-params", "-X", "--skip-missing", "-d", "--danger", "-C", "--max-sql",
+	"-A", "--all-files", "-L", "--loose", "-Y", "--loose-key", "-j", "--jobs",
+	"-q", "--quiet", "-Q", "--no-open", "-h", "--help", "-V", "--version",
+}
+
+// dmCompWatchFlags watch 子命令选项（与 watchParseArgs 注册保持一致）。
+var dmCompWatchFlags = []string{
+	"-a", "--app", "-k", "--op", "-m", "--min-ms", "-l", "--like",
+	"-A", "--all", "-T", "--tail", "-n", "--limit",
+	"-i", "--interval", "--poll", "-g", "--gap",
+	"-d", "--dir", "-p", "--pass", "-H", "--host", "-P", "--port",
+	"-Y", "--sync-log", "--show-paths", "--forget", "-w", "--width",
+	"-F", "--full", "--color", "--no-header", "--sql-only",
+	"-h", "--help",
+}
+
+// dmCompHiddenFlags 补全自身的隐藏选项（主命令层）。
+var dmCompHiddenFlags = []string{
+	"--completion-install", "--completion-uninstall", "--completion-bash", "--completion-install-dry-run",
+}
+
+// dmToBashPath 把 Windows 原生路径转成 Git Bash 能识别的 /c/xxx 形式。
+func dmToBashPath(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	p = strings.ReplaceAll(p, `\`, "/")
+	if len(p) >= 2 && p[1] == ':' {
+		p = "/" + strings.ToLower(p[:1]) + p[2:]
+	}
+	return p
+}
+
+// dmCompScript 生成 bash/zsh 通用补全脚本（zsh 下自动启用 bashcompinit）。
+func dmCompScript(binPath string) string {
+	var b strings.Builder
+	b.WriteString("# dmsqlq bash/zsh 补全（由 `dmsqlq --completion-install` 生成）\n")
+	b.WriteString("# zsh 用户：本脚本会自动加载 bashcompinit，无需额外配置\n\n")
+	fmt.Fprintf(&b, "DMSQLQ_BIN=\"%s\"\n", dmToBashPath(binPath))
+	fmt.Fprintf(&b, "DMSQLQ_MAIN_FLAGS=\"%s\"\n", strings.Join(dmCompMainFlags, " "))
+	fmt.Fprintf(&b, "DMSQLQ_WATCH_FLAGS=\"%s\"\n", strings.Join(dmCompWatchFlags, " "))
+	fmt.Fprintf(&b, "DMSQLQ_HIDDEN_FLAGS=\"%s\"\n\n", strings.Join(dmCompHiddenFlags, " "))
+	b.WriteString(`_dmsqlq() {
+    local cur prev
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    # 判定是否处于 watch 子命令下（第一个非选项词是 watch）
+    local inwatch=0 i w
+    for (( i=1; i < COMP_CWORD; i++ )); do
+        w="${COMP_WORDS[i]}"
+        [[ "$w" == -* ]] && continue
+        [[ "$w" == "watch" ]] && inwatch=1
+        break
+    done
+    case "$prev" in
+        -k|--op)
+            if [[ $inwatch -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "SEL INS UPD DEL DML DDL CAL ERR" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "SEL INS UPD DEL DML DDL CAL ERR" -- "$cur"))
+            fi ;;
+        -E|--exclude-op) COMPREPLY=($(compgen -W "CAL DDL SEL INS UPD DEL" -- "$cur")) ;;
+        -e|--excel|-o|--out|-r|--stats-out|-O|--obj-map|-F|--full-sql|-d|--dir)
+            COMPREPLY=($(compgen -f -- "$cur")) ;;
+    esac
+    if [ ${#COMPREPLY[@]} -eq 0 ]; then
+        if [[ "$cur" == -* ]]; then
+            if [[ $inwatch -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "$DMSQLQ_WATCH_FLAGS -h --help" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "$DMSQLQ_MAIN_FLAGS watch $DMSQLQ_HIDDEN_FLAGS" -- "$cur"))
+            fi
+        else
+            COMPREPLY=($(compgen -f -- "$cur"))   # 位置参数：日志文件/目录
+        fi
+    fi
+    return 0
+}
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    autoload -U +X bashcompinit 2>/dev/null && bashcompinit
+fi
+complete -o default -o filenames -F _dmsqlq dmsqlq
+`)
+	return b.String()
+}
+
+// dmResolveTargets 返回 rc 文件、补全脚本路径与 shell 名。
+func dmResolveTargets() (shell, rcPath, scriptPath string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", "", err
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		if runtime.GOOS == "windows" && strings.HasPrefix(h, "/") {
+			if len(h) >= 3 && h[2] == '/' {
+				home = strings.ToUpper(h[1:2]) + ":" + strings.ReplaceAll(h[2:], "/", `\`)
+			}
+		} else {
+			home = h
+		}
+	}
+	shell = "bash"
+	if strings.Contains(strings.ToLower(os.Getenv("SHELL")), "zsh") {
+		shell = "zsh"
+	}
+	switch shell {
+	case "zsh":
+		rcPath = filepath.Join(home, ".zshrc")
+	default:
+		rcPath = filepath.Join(home, ".bashrc")
+	}
+	scriptPath = filepath.Join(home, ".dmsqlq", "completion.bash")
+	return
+}
+
+// dmCompBlock 生成 rc 标记区块：新终端启动时 mtime 比对，二进制更新过才重新生成。
+func dmCompBlock(binPath string) string {
+	bin := "$(command -v dmsqlq 2>/dev/null)"
+	if binPath != "" {
+		bin = dmToBashPath(binPath)
+	}
+	var b strings.Builder
+	b.WriteString(dmCompMarkBegin + "\n")
+	b.WriteString("# dmsqlq 补全：新终端启动时自动同步（二进制更新后首次启动即刷新；幂等）\n")
+	fmt.Fprintf(&b, "_dmsqlq_bin=\"%s\"\n", bin)
+	b.WriteString("_dmsqlq_comp=\"$HOME/.dmsqlq/completion.bash\"\n")
+	b.WriteString("if [ -x \"$_dmsqlq_bin\" ] && { [ ! -f \"$_dmsqlq_comp\" ] || [ \"$_dmsqlq_bin\" -nt \"$_dmsqlq_comp\" ]; }; then\n")
+	b.WriteString("    \"$_dmsqlq_bin\" --completion-bash > \"$_dmsqlq_comp.tmp\" 2>/dev/null \\\n")
+	b.WriteString("        && mv -f \"$_dmsqlq_comp.tmp\" \"$_dmsqlq_comp\" 2>/dev/null \\\n")
+	b.WriteString("        || rm -f \"$_dmsqlq_comp.tmp\"\n")
+	b.WriteString("fi\n")
+	b.WriteString("[ -f \"$_dmsqlq_comp\" ] && source \"$_dmsqlq_comp\"\n")
+	b.WriteString("unset _dmsqlq_bin _dmsqlq_comp\n")
+	b.WriteString(dmCompMarkEnd + "\n")
+	return b.String()
+}
+
+// dmManageBlock 在 rc 内容中维护标记区块（幂等；返回新内容与动作说明）。
+func dmManageBlock(content, block string, exists bool) (string, string) {
+	if !exists && strings.TrimSpace(content) == "" {
+		return block, "新建文件并写入标记区块"
+	}
+	blockLines := strings.Split(strings.TrimSuffix(block, "\n"), "\n")
+	lines := strings.Split(content, "\n")
+	var out []string
+	inBlock, closed := false, false
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if inBlock {
+			if t == dmCompMarkEnd {
+				inBlock, closed = false, true
+			}
+			continue
+		}
+		if t == dmCompMarkBegin {
+			inBlock = true
+			out = append(out, blockLines...)
+			continue
+		}
+		out = append(out, ln)
+	}
+	if !closed {
+		res := strings.Join(out, "\n")
+		if res != "" && !strings.HasSuffix(res, "\n") {
+			res += "\n"
+		}
+		res += "\n" + block
+		return res, "追加标记区块"
+	}
+	return strings.Join(out, "\n"), "原地更新标记区块"
+}
+
+// dmCompInstall 幂等安装：写补全脚本 + 维护 rc 区块。
+func dmCompInstall(errW io.Writer, binPath string, dryRun bool) error {
+	_, rcPath, scriptPath, err := dmResolveTargets()
+	if err != nil {
+		return err
+	}
+	script := dmCompScript(binPath)
+	block := dmCompBlock(binPath)
+	old, err := os.ReadFile(rcPath)
+	rcExists := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	newRC, action := dmManageBlock(string(old), block, rcExists)
+
+	if dryRun {
+		fmt.Fprintf(errW, "[dry-run] 补全脚本(%d 行) → %s\n", strings.Count(script, "\n"), scriptPath)
+		fmt.Fprintf(errW, "[dry-run] rc → %s：%s\n", rcPath, action)
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(scriptPath, []byte(script), 0644); err != nil {
+		return err
+	}
+	if newRC != string(old) {
+		if err := os.WriteFile(rcPath, []byte(newRC), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dmCompUninstall 幂等卸载：移除 rc 区块 + 删除补全脚本。
+func dmCompUninstall(errW io.Writer, dryRun bool) error {
+	_, rcPath, scriptPath, err := dmResolveTargets()
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		fmt.Fprintf(errW, "[dry-run] 将移除 %s 的 dmsqlq 区块，删除 %s\n", rcPath, scriptPath)
+		return nil
+	}
+	if old, err := os.ReadFile(rcPath); err == nil {
+		var out []string
+		inBlock := false
+		for _, ln := range strings.Split(string(old), "\n") {
+			t := strings.TrimSpace(ln)
+			if t == dmCompMarkBegin {
+				inBlock = true
+				continue
+			}
+			if t == dmCompMarkEnd {
+				inBlock = false
+				continue
+			}
+			if !inBlock {
+				out = append(out, ln)
+			}
+		}
+		_ = os.WriteFile(rcPath, []byte(strings.Join(out, "\n")), 0644)
+	}
+	_ = os.Remove(scriptPath)
+	return nil
+}
+
+// dmAutoInstallSupported Windows 原生 cmd/PowerShell（无 POSIX shell）不适用；抽为变量便于测试。
+var dmAutoInstallSupported = func() bool {
+	if runtime.GOOS != "windows" {
+		return true
+	}
+	return os.Getenv("SHELL") != ""
+}
+
+// dmCompEnsureInstalled 首次运行一次性自动安装补全。
+// 门槛：① 标记文件 ~/.dmsqlq/.completion_auto 不存在 ② 环境适用 ③ rc 无标记区块（有则只补标记）。
+// 提示只写 errW（stderr），绝不触碰 stdout。
+func dmCompEnsureInstalled(errW io.Writer, binPath string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	if h := os.Getenv("HOME"); h != "" && !(runtime.GOOS == "windows" && strings.HasPrefix(h, "/")) {
+		home = h
+	}
+	marker := filepath.Join(home, ".dmsqlq", ".completion_auto")
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	if !dmAutoInstallSupported() {
+		return
+	}
+	_, rcPath, _, err := dmResolveTargets()
+	if err != nil {
+		return
+	}
+	if old, err := os.ReadFile(rcPath); err == nil && strings.Contains(string(old), dmCompMarkBegin) {
+		_ = os.MkdirAll(filepath.Dir(marker), 0755)
+		_ = os.WriteFile(marker, []byte("rc already configured\n"), 0644)
+		return
+	}
+	if err := dmCompInstall(errW, binPath, false); err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(marker), 0755)
+	_ = os.WriteFile(marker, []byte("auto-installed on first run\n"), 0644)
+	fmt.Fprintf(errW, "[dmsqlq] 首次运行：已自动安装 TAB 补全（新终端生效；撤销：dmsqlq --completion-uninstall）\n")
+}
+
+// dmIsTTY 判断文件是否为终端（stderr 为终端才触发自动安装，避免污染管道）。
+func dmIsTTY(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// dmHandleCompletionFlags 处理隐藏补全选项；命中则执行并退出（返回 true）。
+func dmHandleCompletionFlags() bool {
+	self := ""
+	if p, err := os.Executable(); err == nil {
+		self = p
+	}
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "--completion-bash":
+			fmt.Print(dmCompScript(self))
+			os.Exit(0)
+		case "--completion-install":
+			if err := dmCompInstall(os.Stderr, self, false); err != nil {
+				fmt.Fprintf(os.Stderr, "补全安装失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "[ok] 已安装 dmsqlq TAB 补全（幂等）。当前会话生效: source ~/.dmsqlq/completion.bash")
+			os.Exit(0)
+		case "--completion-install-dry-run":
+			if err := dmCompInstall(os.Stderr, self, true); err != nil {
+				fmt.Fprintf(os.Stderr, "补全安装失败: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "--completion-uninstall":
+			if err := dmCompUninstall(os.Stderr, false); err != nil {
+				fmt.Fprintf(os.Stderr, "补全卸载失败: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "[ok] 已卸载 dmsqlq TAB 补全（当前会话可 unset -f _dmsqlq 立即停用）。")
+			os.Exit(0)
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------- main
 
 func main() {
+	// 补全相关隐藏选项：最高优先级，尽早处理
+	dmHandleCompletionFlags()
+	// 子命令分流：watch 模式（实时跟随 SQL 日志）有自己的一套参数与循环，
+	// 与批处理报告路径完全隔离 —— 下面那 1 万多行一行都不用动。
+	if len(os.Args) > 1 && os.Args[1] == "watch" {
+		os.Exit(watchMain(os.Args[2:]))
+	}
 	start := time.Now()
 	if pf := os.Getenv("DMSQLQ_CPU_PROFILE"); pf != "" {
 		f, _ := os.Create(pf)
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
+	}
+	// 首次运行一次性自动安装补全：仅交互终端触发，提示走 stderr，绝不碰 stdout
+	if dmIsTTY(os.Stderr) {
+		self := ""
+		if p, err := os.Executable(); err == nil {
+			self = p
+		}
+		dmCompEnsureInstalled(os.Stderr, self)
 	}
 	if len(os.Args) == 1 { // 不带任何参数：给用法，并尽量直接给出「下一步该敲什么」
 		usage(nil)()
@@ -4670,13 +5395,214 @@ type lockRow struct {
 	MS      float64
 	Mode    string
 	TableID string
-	Table   string
+	Table   string // 表名：--obj-map 给的，或从等待方 SQL 推断来的（见 TableInfer）
 	Waiter  string
 	WaiterU string
 	Holder  string
 	HolderU string
 	Waiters int64
 	TS      string
+
+	// ---- 双方 SQL 与阻塞链（V2.8）----
+	//
+	// 现场要的不是"谁等了谁 5 秒"，而是"**哪条 SQL 在持锁、哪条 SQL 被卡住**"。
+	// 锁行本身只带 trxid，所以这里靠事前按事务收集的语句（见 parser.addTrxStmt）反查。
+	//
+	// 🩸 可得性差异很大，报告必须如实呈现而不是留空：
+	//   实测本批现网日志（KD1 1008，120 次锁等待）——
+	//     等待方 SQL 可得 88%（106/120）：等待方就是触发等待的那条，通常在日志里
+	//     持有方 SQL 可得 23%（28/120）：其余只有 TRX: START / PARAMS / alloc pseg
+	//   拿不到时 HolderStmts 为空，但要靠 HolderKind/HolderEndTS 说明"它确实跑过，
+	//   只是语句文本没进日志（掩码 2~17 未开全）" —— 与"没跑语句"是两回事。
+	WaiterSQL   string
+	WaiterOp    string
+	WaiterMS    float64
+	HolderStmts []trxStmtRec
+	// HolderSQLFromORA 该持有方的 SQL 是从掩码 27 的 [ORA]（原始语句）行兜底找回来的（V2.12）。
+	// 命中它说明：这个事务的语句跑得太快、**执行行被 MIN_EXEC_TIME 滤掉了** ——
+	// 既不是"没执行"，也不是"采集位没开全"。报告要如实标出这个来源。
+	HolderSQLFromORA bool
+	HolderRoot       string // 链首 = 真正的持锁者（其余都是排在它后面的）
+	HolderKind       string // 该事务最后的结局：COMMIT / ROLLBACK / ""（日志里未见结束）
+	HolderEndTS      string
+	Chain            []string // 排队链（含根），来自日志的 trx[...] 列表
+	ChainMore        bool     // 该链被日志截断（带 ...more）
+	TableInfer       bool     // Table 是从等待方 SQL 推断出来的（不是 --obj-map 给的）
+}
+
+// lockChain 一条阻塞链（V2.8）：同表、同根事务的一串等待。
+//
+// 为什么按「表 + 根事务」聚合：日志的持有方列表是累计排队的，
+// 同一条链会在每个等待者那一行里重复出现。聚起来才能回答
+// 「是哪一个事务、把多少人堵了多久」—— 这才是根因视角。
+type lockChain struct {
+	TableID     string
+	Table       string
+	Root        string
+	RootUser    string
+	Count       int64   // 该链上的等待事件次数
+	MaxMS       float64 // 最长等待（≈ 根事务持锁时长）
+	SumMS       float64
+	ChainLen    int      // 排队事务数（取日志给出的最长一次）
+	Span        string   // 波及时段 "HH:MM:SS ~ HH:MM:SS"
+	WaiterUsers []string // 被波及的等待方用户（去重，控量）
+	rows        []lockRow
+}
+
+// buildLockChains 把锁等待明细聚成阻塞链，按「最长等待」降序。
+func buildLockChains(rows []lockRow) []lockChain {
+	idx := map[string]*lockChain{}
+	var out []lockChain
+	for _, r := range rows {
+		root := r.HolderRoot
+		if root == "" {
+			root = r.Holder
+		}
+		k := r.TableID + "\x00" + root
+		c := idx[k]
+		if c == nil {
+			c = &lockChain{TableID: r.TableID, Table: r.Table, Root: root,
+				RootUser: r.HolderU, Span: shortTS(r.TS)}
+			idx[k] = c
+		}
+		c.Count++
+		c.SumMS += r.MS
+		if r.MS > c.MaxMS {
+			c.MaxMS = r.MS
+		}
+		if len(r.Chain) > c.ChainLen {
+			c.ChainLen = len(r.Chain)
+		}
+		c.Span = shortTS(r.TS) + " ~ " + shortTS(r.TS)
+		c.rows = append(c.rows, r)
+	}
+	for _, c := range idx {
+		// 时段取该链上最早/最晚那次等待
+		if len(c.rows) > 0 {
+			first, last := c.rows[0].TS, c.rows[0].TS
+			us := map[string]bool{}
+			for _, r := range c.rows {
+				if r.TS < first {
+					first = r.TS
+				}
+				if r.TS > last {
+					last = r.TS
+				}
+				if r.WaiterU != "" {
+					us[r.WaiterU] = true
+				}
+			}
+			c.Span = shortTS(first) + " ~ " + shortTS(last)
+			for u := range us {
+				c.WaiterUsers = append(c.WaiterUsers, u)
+			}
+			sort.Strings(c.WaiterUsers)
+			if len(c.WaiterUsers) > 3 {
+				c.WaiterUsers = c.WaiterUsers[:3]
+			}
+		}
+		out = append(out, *c)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].MaxMS > out[j].MaxMS })
+	return out
+}
+
+// hLockCards 输出「锁等待双方 SQL」卡片（HTML）。
+//
+// 一张卡片 = 一次锁等待：左边等待方（它当时在跑哪条 SQL），右边持有方
+// （链首事务的完整活动轨迹 + 结局）。超量时沿用长表折叠：默认前 keep 张，
+// 打印时全展开（见 .lkcard 的 @media print 规则）。
+func hLockCards(w io.Writer, rows []lockRow, keep int) {
+	if len(rows) == 0 {
+		return
+	}
+	fold := keep > 0 && len(rows) > keep+1
+	// 卡片整体包一层容器，折叠时给容器切 open 类 —— 与长表折叠复用同一套
+	// 按钮与 JS（按钮只认「前一兄弟 + open 类」），不必再养第二条交互路径。
+	io.WriteString(w, "<div class=\"lkcards\">\n")
+	for i, r := range rows {
+		cls := "lkcard"
+		if fold && i >= keep {
+			cls += " hid"
+		}
+		fmt.Fprintf(w, "<div class=\"%s\">\n", cls)
+		// 卡片头
+		fmt.Fprintf(w, "<div class=\"lkhead\"><span class=\"lkidx\">#%d</span>"+
+			"<span class=\"lkwait\">等待 %s</span><span class=\"lktbl\">%s</span>"+
+			"<span class=\"lkmode\">%s 锁</span><span class=\"lkts\">%s</span></div>\n",
+			i+1, hEsc(fmtDur(r.MS)), hEsc(lockObj(r.Table, r.TableID)), hEsc(r.Mode), hEsc(shortTS(r.TS)))
+		io.WriteString(w, "<div class=\"lkbody\">\n")
+
+		// 等待方
+		io.WriteString(w, "<div class=\"lkside\">\n")
+		fmt.Fprintf(w, "<div class=\"lksideh\">等待方 · trx <code>%s</code> · %s</div>\n",
+			hEsc(dash(r.Waiter)), hEsc(dash(r.WaiterU)))
+		if r.WaiterSQL != "" {
+			fmt.Fprintf(w, "<div class=\"lksql\"><span class=\"lkop\">[%s]</span> <code>%s</code>"+
+				"<span class=\"lkdur\">%s</span></div>\n",
+				hEsc(r.WaiterOp), hEsc(clipCell(r.WaiterSQL, 300)), hEsc(fmtDur(r.WaiterMS)))
+		} else {
+			io.WriteString(w, "<div class=\"lkmiss\">该事务在日志里没有可用 SQL 文本"+
+				"（常见成因：语句很快被 <code>MIN_EXEC_TIME</code> 滤掉，或执行中被中止）"+
+				"—— 用 <code>-x "+hEsc(dash(r.Waiter))+" -N</code> 可单独抽取确认。</div>\n")
+		}
+		io.WriteString(w, "</div>\n")
+
+		// 持有方
+		io.WriteString(w, "<div class=\"lkside\">\n")
+		extra := ""
+		if len(r.Chain) > 1 {
+			extra = fmt.Sprintf("，另有 %d 个事务排在它后面", len(r.Chain)-1)
+		}
+		fmt.Fprintf(w, "<div class=\"lksideh\">持有方（链首）· trx <code>%s</code> · %s%s</div>\n",
+			hEsc(dash(r.HolderRoot)), hEsc(dash(r.HolderU)), extra)
+		if len(r.HolderStmts) > 0 {
+			for _, sm := range r.HolderStmts {
+				fmt.Fprintf(w, "<div class=\"lksql\"><span class=\"lkop\">[%s]</span> <code>%s</code>"+
+					"<span class=\"lkdur\">%s</span></div>\n",
+					hEsc(sm.Op), hEsc(clipCell(sm.SQL, 300)), hEsc(fmtDur(sm.MS)))
+			}
+			if r.HolderSQLFromORA {
+				io.WriteString(w, "<div class=\"lkora\">↑ 来源：掩码 <b>27</b> 的 <code>[ORA]</code> 原始语句行"+
+					" —— 该语句执行很快，<b>执行完成行被 <code>MIN_EXEC_TIME</code> 滤掉了</b>，"+
+					"所以从执行行里看不到它（它不是没执行）。</div>\n")
+			}
+		} else {
+			io.WriteString(w, "<div class=\"lkmiss\">该事务的语句在日志里<b>没有可用的 SQL 文本</b>"+
+				"（有 <code>PARAMS</code> 与段页分配，却没有 <code>[类型] … EXECTIME</code>）。"+
+				"两种常见成因，<b>都不是「没执行」</b>：<br>① <b>语句执行很快、完成行被 "+
+				"<code>MIN_EXEC_TIME</code> 滤掉</b>（现网最常见；采集掩码含位 27 时本工具已能自动找回）；"+
+				"<br>② 语句执行中被中止。<b>不是采集位没开全</b>。</div>\n")
+		}
+		if r.HolderKind != "" {
+			act := "提交"
+			if r.HolderKind == "ROLLBACK" {
+				act = "回滚"
+			}
+			fmt.Fprintf(w, "<div class=\"lkend\">结局：<b>%s</b>（%s）</div>\n", act, hEsc(shortTS(r.HolderEndTS)))
+		} else {
+			io.WriteString(w, "<div class=\"lkend\">结局：本批日志里未见 COMMIT / ROLLBACK</div>\n")
+		}
+		io.WriteString(w, "</div>\n")
+
+		io.WriteString(w, "</div>\n") // lkbody
+		io.WriteString(w, "</div>\n") // lkcard
+	}
+	io.WriteString(w, "</div>\n") // lkcards
+	if fold {
+		fmt.Fprintf(w, "<div class=\"foldbar\"><button data-fold=\"%d\" type=\"button\">"+
+			"展开全部 %d 条</button><span class=\"fnote\">默认只显示前 %d 条；"+
+			"打印 / 导出 PDF 时自动全部展开。</span></div>\n", len(rows), len(rows), keep)
+	}
+}
+
+// clipCell 单行截断（卡片里不让长 SQL 撑破布局）
+func clipCell(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + " …"
 }
 
 // bucketRow 负载时间桶（QPS/语句数按时间聚合，用于看业务高峰）
@@ -4709,6 +5635,7 @@ type statsView struct {
 	// 全局耗时分位（对数直方图算出来的）
 	P50, P90, P95, P99 float64
 	DurMax             float64 // 真实最大耗时（与直方图一起，用于分位对照）
+	MinExecMS          float64 // 最小耗时（由直方图最低非空桶近似，桶精度约 ±15%）
 	// 每事务语句数分布（识别"逐条提交"）
 	TrxStmtN    int64
 	TrxStmtHist [6]int64 // 1 条 / 2-5 / 6-20 / 21-100 / 101-1000 / >1000
@@ -4760,6 +5687,23 @@ type statsView struct {
 	LockRows    []lockRow
 	LockTables  []lockTableRow
 	LockTableN  int // 涉及对象总数（LockTables 会被 -p 截断，这个不会）
+	// 双方 SQL 的可得性（V2.8）：报告要如实说明"取到了几条"，
+	// 否则读者会以为"没显示 = 没有"。分母是**全部**锁等待条数（LockTotalN），
+	// 不是 -p 截断后的显示条数 —— 用截断值当分母会出现「20/20 但一条 SQL 都没显示」
+	// 这种自相矛盾的句子（项目里踩过同类坑：显示上限污染了统计口径）。
+	LockWaiterSQLN int
+	LockHolderSQLN int
+	LockTotalN     int // 本次锁等待总条数（未受 -p 影响）
+	// 锁等待明细全量（V2.8）：卡片视图要覆盖**全部**等待（用户明确要求），
+	// 而 LockRows 会被 -p 截断给表格用。两个视图分开建，互不污染。
+	LockRowsAll []lockRow
+	LockChains  []lockChain
+	// 表名（大写）→ 锁等待累计毫秒。用 st.LockByTable 全量算，不受 -p 截断影响。
+	// 用途：识别「等锁受害者」—— 见 recommend（V2.10）。
+	LockSumByName map[string]float64
+	// 锁等待排查方向（V2.11）：把分散在几十张卡片里的「结局/时刻/分布」汇总成
+	// 「先看什么、再看什么、往哪查」。见 lockGuide()。
+	LockGuide []guideRow
 	// 溯源
 	TrxUser      map[string]string // 报告涉及的 trxid → 用户（回答"谁在持锁"）
 	ObjMap       map[string]string // 对象 ID → 表名
@@ -4862,6 +5806,7 @@ func buildStatsViewTop(st *Stats, opt *Options, elapsed time.Duration, top int) 
 		P50: st.H.quantile(0.50), P90: st.H.quantile(0.90),
 		P95: st.H.quantile(0.95), P99: st.H.quantile(0.99),
 		DurMax:     st.H.maxMS,
+		MinExecMS:  st.H.minApprox(),
 		ExecIDSeen: st.execIDSeen,
 
 		ParamsN: st.ParamsN, TrxEventN: st.TrxEventN, TrxEndN: st.TrxEndN,
@@ -4937,7 +5882,13 @@ func buildStatsViewTop(st *Stats, opt *Options, elapsed time.Duration, top int) 
 	}
 	// 优先优化推荐：与 Tpls 同源（已按累计耗时降序），占比分母也用同一批 ——
 	// 这样报告里的「影响占比」与 Excel 交付件的「占总耗时」是同一个数。
-	v.Advice = v.recommend(adviceLimit)
+	//
+	// 🩸 但它**不能在这里算**（V2.10）：recommend 现在要用「某张表的锁等待累计」
+	// 来识别**等锁受害者**，而那批数据在下面的锁等待段才装配 ——
+	// 建早了 LockSumByName 还是 nil，识别静默失效（实测就是这么静默失效的：
+	// 改了代码、编译通过、跑起来那条 INSERT 仍被当成优化对象）。
+	// 已移到锁等待段之后统一计算。
+	_ = adviceLimit // 见下方「锁等待」段末尾的 v.Advice 赋值
 
 	for u, a := range st.ByUser {
 		v.Users = append(v.Users, userRow{User: u, Count: a.Count, Sum: a.SumMS, Max: a.MaxMS,
@@ -5265,20 +6216,134 @@ func buildStatsViewTop(st *Stats, opt *Options, elapsed time.Duration, top int) 
 		}
 		return ""
 	}
+	// ---- 锁等待溯源（V2.8）：把锁行与「事务的语句」接起来 ----
+	//
+	// 采集期把语句按 trxid 平铺存了（st.trxStmts），这里只对**锁等待涉及的事务**
+	// 建一次索引 —— 锁等待是百级，索引代价可忽略。
+	stmtsByTrx := make(map[string][]trxStmtRec, len(st.trxStmts))
+	for _, r := range st.trxStmts {
+		stmtsByTrx[r.TrxID] = append(stmtsByTrx[r.TrxID], r)
+	}
+	endsByTrx := make(map[string]trxEndRec, len(st.trxEnds))
+	for _, e := range st.trxEnds {
+		endsByTrx[e.TrxID] = e // 后者覆盖前者：取最后一次结束事件
+	}
+
+	// 对象 ID → 表名的推断：日志只记 table id 不记表名，以往要靠 --obj-map
+	// 手工查数据字典。这里从**等待方 SQL** 里抽表名给同 ID 投票 ——
+	// 等待方正卡在这张表上，它的语句里出现的那张表就是高度相关的候选。
+	// 实测命中率极高（本批 4 张热表 100% 推对），但要标「推断」而不是当事实。
+	tableVotes := make(map[string]map[string]int) // tableID -> 表名 -> 票数
 	for _, lk := range st.Locks {
-		v.LockRows = append(v.LockRows, lockRow{
+		for _, sm := range stmtsByTrx[lk.Waiter] {
+			eachTable([]byte(sm.SQL), sm.Op, func(name string, write bool) {
+				if name == "" {
+					return
+				}
+				v := 1
+				if write && (lk.Mode == "X" || lk.Mode == "IX") {
+					v = 2 // X 锁基本只可能是写目标表
+				}
+				m := tableVotes[lk.TableID]
+				if m == nil {
+					m = map[string]int{}
+					tableVotes[lk.TableID] = m
+				}
+				m[strings.ToUpper(name)] += v
+			})
+		}
+	}
+	inferName := func(id string) string {
+		m := tableVotes[id]
+		best, bestN := "", 0
+		for k, n := range m {
+			if n > bestN || (n == bestN && k < best) {
+				best, bestN = k, n
+			}
+		}
+		return best
+	}
+
+	for _, lk := range st.Locks {
+		row := lockRow{
 			MS: lk.MS, Mode: lk.Mode, TableID: lk.TableID,
 			Table:  tableNameOf(lk.TableID, opt.objMap),
 			Waiter: lk.Waiter, WaiterU: lk.User,
 			Holder: lk.Holder, HolderU: holderU(lk.Holder),
 			Waiters: lk.Waiters, TS: lk.TS,
-		})
+		}
+		// 等待方：最后一条语句就是触发等待的那条
+		if ss := stmtsByTrx[lk.Waiter]; len(ss) > 0 {
+			last := ss[len(ss)-1]
+			row.WaiterSQL, row.WaiterOp, row.WaiterMS = last.SQL, last.Op, last.MS
+		}
+		// 持有方：链首才是真正持锁的那个事务
+		chain := splitTrxList(lk.Holder)
+		if len(chain) > 0 {
+			root := chain[0]
+			row.HolderRoot = root
+			row.Chain = chain
+			row.HolderStmts = stmtsByTrx[root]
+			if len(row.HolderStmts) == 0 {
+				// V2.12 兜底：持有方没有执行行（语句跑得太快、被 MIN_EXEC_TIME 滤掉）时，
+				// 用 DLCK 行留下的 (sess,thrd,stmt) 键，到掩码 27 的 [ORA] 行取回原始 SQL。
+				// 取不到才真的"取不到"—— 此时报告仍要显式说明原因（见 HolderStmts 注释）。
+				if sql := st.oraSQLOfTrx(root); sql != "" {
+					row.HolderStmts = []trxStmtRec{{TrxID: root, Op: "ORA", SQL: sql}}
+					row.HolderSQLFromORA = true
+				}
+			}
+			if e, ok := endsByTrx[root]; ok {
+				row.HolderKind, row.HolderEndTS = e.Kind, e.TS
+			}
+		}
+		row.ChainMore = lk.More
+		if row.Table == "" {
+			if nm := inferName(lk.TableID); nm != "" {
+				row.Table, row.TableInfer = nm, true
+			}
+		}
+		v.LockRows = append(v.LockRows, row)
 	}
 	sort.SliceStable(v.LockRows, func(i, j int) bool { return v.LockRows[i].MS > v.LockRows[j].MS })
+	// 链与可得性统计都在**截断之前**算：它们描述的是全量事实，
+	// 不该被 -p 的显示上限影响（否则改显示条数会连结论一起变）。
+	v.LockTotalN = len(v.LockRows)
+	for _, r := range v.LockRows {
+		if r.WaiterSQL != "" {
+			v.LockWaiterSQLN++
+		}
+		if len(r.HolderStmts) > 0 {
+			v.LockHolderSQLN++
+		}
+	}
+	v.LockChains = buildLockChains(v.LockRows)
+	// 卡片视图用全量副本（上面那两处统计也基于它）；LockRows 随后会被 -p 截断
+	v.LockRowsAll = v.LockRows
+	// 排查方向（V2.11）：必须在 LockRowsAll 就绪之后算（它读的是全量）。
+	// 与 V2.10 那个「建太早导致判定静默失效」同一个坑，这里按依赖顺序摆。
+	v.LockGuide = v.lockGuide()
 	if len(v.LockRows) > top { // 同「最慢语句」：容量按 rowCap，展示按 top
 		v.LockRows = v.LockRows[:top]
 	}
+	// 表名 → 锁等待累计（V2.10）：供「优先优化推荐」识别**等锁受害者**。
+	// 用全量的 st.LockByTable（v.LockTables 会被 top 截断，统计不能取自截断后的表）。
+	// 名字优先 --obj-map，其次用与锁卡片同一套「等待方 SQL 投票」推断。
+	v.LockSumByName = make(map[string]float64, len(st.LockByTable))
+	for id, a := range st.LockByTable {
+		nm := tableNameOf(id, opt.objMap)
+		if nm == "" {
+			nm = inferName(id)
+		}
+		if nm == "" {
+			continue
+		}
+		v.LockSumByName[strings.ToUpper(baseTableName(nm))] += a.SumMS
+	}
 	v.LockTableN = len(st.LockByTable)
+	// 「优先优化推荐」放到这里算：它依赖上面的 LockSumByName（识别等锁受害者）。
+	// 建在结构体初始化处会因数据未就绪而静默失效 —— 见那里的注释。
+	v.Advice = v.recommend(adviceLimit)
 	for id, a := range st.LockByTable {
 		users := make([]string, 0, len(a.Users))
 		for u := range a.Users {
@@ -5531,6 +6596,29 @@ func configCheck(v *statsView) []cfgRow {
 		}
 		rows = append(rows, cfgRow{"执行行耗时覆盖（掩码 24/25）",
 			fmt.Sprintf("%.2f%%（%s / %s 行带 EXECTIME）", cov, pad(execRows-miss), pad(execRows)), adv})
+	}
+	// 3b) 最小耗时：识别采集侧的 MIN_EXEC_TIME
+	//
+	// 🩸 现网实测（金蝶 ERP，2026-10-08）：那份日志里 **UPDATE 一条都没有**，
+	// 但同期重做日志 3 分钟涨 635MB、归档文件 16 分钟长 2GB —— 写量与日志严重不符，
+	// 第一反应会归因成「UPDATE 采集位没开」。**那是错的**：
+	// 线上 SQL_TRACE_MASK=2:3:25:28:29 中位号 2（=DML=4~10）本就含 UPDATE。
+	// 真正的过滤器是 **MIN_EXEC_TIME = 100** —— 任何单条 <100ms 的语句都不写日志，
+	// **与语句类型无关**。判据就是这一条：日志里最小 EXECTIME 恰好卡在某整数阈值上
+	// （实测最小值 100.00ms、低于 100ms 的 0 条 / 1729 条）。
+	// 所以「日志里没有某类语句」不能直接推「掩码漏开」，得先看最小耗时。
+	if v.MinExecMS > 0 && execRows > 0 {
+		adv := "正常（采集侧未设最小耗时阈值，或阈值低于日志里最快的语句）"
+		for _, th := range []float64{1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000} {
+			if v.MinExecMS >= th && v.MinExecMS <= th*1.16 {
+				adv = fmt.Sprintf("⚠️ 最小耗时**恰好卡在 %s 附近**，极可能采集侧设了 MIN_EXEC_TIME=%s"+
+					"——**低于该值的语句不写日志，且与语句类型无关**。"+
+					"此时「日志里没有某类语句」（如 UPDATE / DELETE）不代表掩码漏开，先核对 V$DM_SQLLOG_CONFIG 的 MIN_EXEC_TIME",
+					fmtDur(th), fmtInt(int64(th)))
+				break
+			}
+		}
+		rows = append(rows, cfgRow{"最小 EXECTIME", fmtDur(v.MinExecMS) + "（由耗时直方图近似，精度约 ±15%）", adv})
 	}
 	// 4) 参数行（掩码 28）
 	if v.ParamsN == 0 {
@@ -5958,6 +7046,14 @@ func max64(a, b int64) int64 {
 	return b
 }
 
+// minInt 两整数取小（终端视图截断条数用）
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // buildBuckets 按自适应粒度聚合负载时间分布（看业务高峰用）。
 //
 // 粒度规则：跨度 ≤2 小时 → 分钟；≤3 天 → 小时；更长 → 天。
@@ -6209,7 +7305,14 @@ func buildHints(v *statsView, st *Stats) []string {
 	case v.DlckN > 0:
 		h = append(h, fmt.Sprintf("日志里有 %s 条锁操作计时行（DLCK）但**没有一条真实等待**（无 wait for）："+
 			"说明这段时间没有阻塞。注意 `DLCK used time:0(us)` 是常态 —— 它是执行计划里锁节点的自身耗时，不是等待时长。", fmtInt(v.DlckN)))
-	case v.LockN == 0 && v.DlckN == 0:
+	case v.Mask29On:
+		// 🩸 这一支必须有：位号 29 是**日志的属性**，不是「本次范围内的行数」。
+		// 用 -f/-t 过滤出一个小窗口时，窗口内事务事件数天然是 0，
+		// 若掉进下面那个 default 就会写出「日志里没有任何事务事件行、请确认掩码是否含 29」——
+		// 而同一份报告的锁等待小节刚说过「位号 29 已开」。两句话自相矛盾。
+		h = append(h, fmt.Sprintf("位号 29 已开（日志里有 %s 条事务事件），本次范围内**一条锁等待都没有** —— "+
+			"这个 0 是可信的「确实没发生」，不是「没采集」。", fmtInt(v.TrxEventN+v.TrxEndN)))
+	default:
 		h = append(h, "日志里没有任何锁/事务事件行：先确认 sqllog.ini 的 SQL_TRACE_MASK 是否含 29（锁类型与锁等待时间、"+
 			"事务起止都归这一位），其次是 sqllog.ini 有没有真正生效（看 V$DM_SQLLOG_CONFIG.MODE_NAME 是否为 <DEFAULT>）；"+
 			"两者都正常则说明该时段确实没有锁竞争。")
@@ -6379,6 +7482,21 @@ func (v *statsView) recommend(limit int) []adviceRow {
 			prio = "次之"
 		}
 		sig, act := diagnoseSQL(r, medMS)
+		// 🩸 先排除「等锁受害者」（V2.10）：这条语句的累计耗时如果基本就是
+		// 某张表上的锁等待，那么它**不是优化对象** —— 单行 INSERT / 等值 UPDATE
+		// 本身不慢，去 EXPLAIN 它什么也看不出来。真正的动作在「锁等待」一节：
+		// 处理那个长时间持锁的根事务。
+		// 排序（占比）保持不动：这份耗时是真实发生的，账要照记；
+		// 但优先级标签改成「等锁」，避免把注意力引到 SQL 改写上。
+		if ratio, tbl := v.lockVictim(r.Sample, r.Sum); ratio > 0 {
+			prio = "等锁"
+			sig = "等锁，不是语句本身慢"
+			act = fmt.Sprintf("这条累计 %s，其中 **%.0f%%** 是堵在 `%s` 的锁上（该表锁等待累计 %s）—— "+
+				"单行/等值访问本身不慢，**改这条 SQL 没有收益，EXPLAIN 也看不出问题**。"+
+				"要动的是**持有方**：见「锁等待」一节的阻塞链，处理那个长时间持锁的根事务"+
+				"（缩短事务跨度、或把它拆小）；必要时核对 `V$TRXWAIT` / `V$LOCK`。",
+				fmtDur(r.Sum), ratio*100, tbl, fmtDur(v.LockSumByName[tbl]))
+		}
 		out = append(out, adviceRow{
 			Prio: prio, Share: share, Count: r.Count,
 			Avg: r.Avg, Max: r.Max, Sum: r.Sum, Min: r.Min,
@@ -6395,7 +7513,347 @@ func (v *statsView) recommend(limit int) []adviceRow {
 	return out
 }
 
-// adviceCoverPct 推荐清单覆盖的耗时占比（回答"照这个清单改，收益上限是多少"）
+// baseTableName 去掉 schema 前缀与双引号：`"SCH"."T_X"` → `T_X`。
+// 用于把「对象映射里给的名字」与「SQL 里出现的表名」对齐 ——
+// 两边一个带 schema 一个不带就会配不上，白白漏掉匹配。
+func baseTableName(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.Trim(s, "\"`[]")
+}
+
+// stmtMainTable 取语句的「主表」：写语句取写目标表，读语句取第一张 FROM 表。
+// 取不到返回空串。用途：把一条语句与「某张表上的锁等待」对上（见 recommend）。
+func stmtMainTable(sql string) string {
+	op := "SEL"
+	switch u := strings.ToUpper(strings.TrimLeft(sql, " \t\r\n(")); {
+	case strings.HasPrefix(u, "INSERT"):
+		op = "INS"
+	case strings.HasPrefix(u, "UPDATE"):
+		op = "UPD"
+	case strings.HasPrefix(u, "DELETE"):
+		op = "DEL"
+	case strings.HasPrefix(u, "MERGE"):
+		op = "DML"
+	}
+	var w, anyT string
+	eachTable([]byte(sql), op, func(name string, write bool) {
+		if name == "" {
+			return
+		}
+		if write && w == "" {
+			w = name
+		}
+		if anyT == "" {
+			anyT = name
+		}
+	})
+	if w != "" {
+		return w
+	}
+	return anyT
+}
+
+// guideRow 「锁等待排查方向」的一条。设计原则与诊断信号同源：
+// **只写日志能证实的事实（Fact）**，推断要标出来（Note），并且每条都给「往哪查」。
+type guideRow struct {
+	Step  int
+	Title string
+	Fact  string // 实测事实（来自日志，可直接引用）
+	Note  string // 形态推断（有假设，要说清"日志不能证明什么"）
+	Next  string // 往哪查 / 怎么查
+}
+
+// tsMillis 把 "2026-10-08 09:06:55.428" 解成当天毫秒数（只用于比较先后与间隔）。
+// 解析失败返回 -1。
+func tsMillis(ts string) int64 {
+	if len(ts) < 23 {
+		return -1
+	}
+	// "YYYY-MM-DD HH:MM:SS.mmm" —— 取 11..22 段
+	var hh, mm, ss, ms int64
+	ok := true
+	dig := func(a, b int) int64 {
+		v := int64(0)
+		for i := a; i < b; i++ {
+			c := ts[i]
+			if c < '0' || c > '9' {
+				ok = false
+				return 0
+			}
+			v = v*10 + int64(c-'0')
+		}
+		return v
+	}
+	hh, mm, ss, ms = dig(11, 13), dig(14, 16), dig(17, 19), dig(20, 23)
+	if !ok {
+		return -1
+	}
+	return ((hh*60+mm)*60+ss)*1000 + ms
+}
+
+// lockGuide 生成「锁等待排查方向」。
+//
+// 🩸 为什么要有这一节（V2.11，现场提问）：报告把根事务的**结局**（提交/回滚）都列出来了，
+// 读者下一句必然问「**全是回滚，那我往哪儿查？**」。这些信息分散在几十张卡片里，
+// 读者得自己横着看才能拼出结论 —— 那是报告该替他做的事。
+//
+// 本节的规矩：**每一步先给"日志能证实的事实"，再给"怎么读"，最后给"往哪查"**；
+// 形态推断单独标出并写明「日志不能证明什么」—— 不替读者下没有依据的结论。
+// lockGuide 生成「锁等待排查方向」。
+//
+// 🩸 为什么要有这一节（V2.11，现场提问）：报告把根事务的**结局**（提交/回滚）都列出来了，
+// 读者下一句必然问「**全是回滚，那我往哪儿查？**」。这些信息分散在几十张卡片里，
+// 读者得自己横着看才能拼出结论 —— 那是报告该替他做的事。
+//
+// 本节的规矩：**每一步先给「日志能证实的事实」，再给「怎么读」，最后给「往哪查」**；
+// 形态推断单独标出并写明「日志不能证明什么」—— 不替读者下没有依据的结论。
+func (v *statsView) lockGuide() []guideRow {
+	if len(v.LockRowsAll) == 0 {
+		return nil
+	}
+	// 根事务（链首）去重
+	type rootInfo struct {
+		kind string
+		end  string
+	}
+	roots := map[string]*rootInfo{}
+	for i := range v.LockRowsAll {
+		r := &v.LockRowsAll[i]
+		root := r.HolderRoot
+		if root == "" {
+			continue
+		}
+		if _, ok := roots[root]; !ok {
+			roots[root] = &rootInfo{kind: r.HolderKind, end: r.HolderEndTS}
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	nRoll, nCommit, nNone := 0, 0, 0
+	for _, ri := range roots {
+		switch ri.kind {
+		case "ROLLBACK":
+			nRoll++
+		case "COMMIT":
+			nCommit++
+		default:
+			nNone++
+		}
+	}
+
+	var out []guideRow
+	step := 0
+	add := func(title, fact, note, next string) {
+		step++
+		out = append(out, guideRow{Step: step, Title: title, Fact: fact, Note: note, Next: next})
+	}
+
+	// ---- 第 1 步：结局分布 ----
+	noneTail := ""
+	if nNone > 0 {
+		noneTail = fmt.Sprintf(" / 日志里未见结束 %d", nNone)
+	}
+	fact1 := fmt.Sprintf("根事务共 %d 个：**回滚 %d / 提交 %d**%s。", len(roots), nRoll, nCommit, noneTail)
+	note1 := "回滚通常意味着「这一批业务没做成」。但**日志只能告诉你它回滚了，不能告诉你为什么回滚**" +
+		" —— 可能是应用主动回滚（业务校验不通过），也可能是被中止（批次超时 / 任务被取消 / 连接被断）。"
+	next1 := "如果回滚占多数，下一步看**回滚时刻**（见下一步），而不是急着去改 SQL。"
+	add("先看根事务的结局分布", fact1, note1, next1)
+
+	// ---- 第 2 步：回滚时刻是否成簇（本节最有信息量的一条）----
+	type tsPair struct {
+		ms int64
+		ts string
+	}
+	var rb []tsPair
+	for _, ri := range roots {
+		if ri.kind != "ROLLBACK" || ri.end == "" {
+			continue
+		}
+		if ms := tsMillis(ri.end); ms >= 0 {
+			rb = append(rb, tsPair{ms: ms, ts: ri.end})
+		}
+	}
+	if len(rb) >= 2 {
+		sort.Slice(rb, func(i, j int) bool { return rb[i].ms < rb[j].ms })
+		const win = 3000 // 3 秒窗口
+		best, bestI := 0, 0
+		for i := 0; i < len(rb); i++ {
+			j := i
+			for j+1 < len(rb) && rb[j+1].ms-rb[i].ms <= win {
+				j++
+			}
+			if n := j - i + 1; n > best {
+				best, bestI = n, i
+			}
+		}
+		if best >= 2 {
+			ratio := float64(best) / float64(len(rb))
+			span := v.lockGuideSpan(rb[bestI].ts, rb[bestI+best-1].ts)
+			fact2 := fmt.Sprintf("**%d 个根事务在 %s内集中回滚**（%s ~ %s，占全部回滚根事务的 %.0f%%）。",
+				best, span, shortTS(rb[bestI].ts), shortTS(rb[bestI+best-1].ts), ratio*100)
+			note2 := ""
+			if best >= 3 && ratio >= 0.5 {
+				note2 = "形态上更像**一次协调性中止**（应用决定整体回滚），而不是偶发失败 —— " +
+					"但**这只是形态推断**：日志能证明的是「同一时刻集中回滚」，**证明不了原因**，" +
+					"原因必须去应用侧确认。"
+			}
+			next2 := "**先去应用日志找这个时刻前后发生了什么**：批次超时？任务被取消？连接被断？" +
+				"集中回滚更符合「应用侧一次性把这一批全部回滚」，而不是各事务自己失败。"
+			add("再看回滚时刻是不是成簇（这一条最有用）", fact2, note2, next2)
+		}
+	}
+
+	// ---- 第 3 步：是不是多个会话在做同一件事 ----
+	tplCnt := map[string]int{}
+	for i := range v.LockRowsAll {
+		if s := v.LockRowsAll[i].WaiterSQL; s != "" {
+			tplCnt[normalizeTpl(s)]++
+		}
+	}
+	topTpl, topN := "", 0
+	for t, n := range tplCnt {
+		if n > topN {
+			topTpl, topN = t, n
+		}
+	}
+	if topN >= 3 {
+		fact3 := fmt.Sprintf("等待方执行得最多的一条语句出现了 **%d 次**：`%s`；根事务分布在 **%d 个不同的事务**上。",
+			topN, clipCell(topTpl, 110), len(roots))
+		note3 := "多个会话反复执行同一条语句、落在同一批表上，像是**同一个批次被并发执行**。" +
+			"但要区分「抢同一张表」和「抢同一个业务键」—— 日志里的语句模板一样，" +
+			"**不代表参数（业务键）一样**。"
+		next3 := "用 `dmsqlq <同一路径> -x <根事务号> -N` 导出几个根事务，**比对它们的参数值是否相同**。" +
+			"若相同 ⇒ 并发批次在抢同一业务范围，查应用侧的批次拆分/分片逻辑；" +
+			"若不同 ⇒ 只是表级热点，考虑缩短事务或调整并发度。"
+		add("确认是不是多个会话在做同一件事", fact3, note3, next3)
+	}
+
+	// ---- 第 4 步：根事务为什么能持锁这么久 ----
+	longMS := int64(0)
+	longRoot, longTbl := "", ""
+	missRoot := 0
+	for i := range v.LockRowsAll {
+		r := &v.LockRowsAll[i]
+		if r.HolderRoot == "" {
+			continue
+		}
+		if r.MS > float64(longMS) {
+			longMS, longRoot, longTbl = int64(r.MS), r.HolderRoot, r.Table
+		}
+		if len(r.HolderStmts) == 0 {
+			missRoot++
+		}
+	}
+	if longMS > 0 {
+		fact4 := fmt.Sprintf("最长一次等待 **%s**（根事务 `%s`，表 %s）；全部 %d 次等待里有 **%d 次**的持有方在日志里拿不到语句文本。",
+			fmtDur(float64(longMS)), longRoot, dash(longTbl), len(v.LockRowsAll), missRoot)
+		note4 := "持锁时间 = 根事务那条语句的执行时间。持有方 SQL 缺失**不等于「没执行」** —— " +
+			"实测（133 构造实验）**最常见的原因是「语句执行很快、执行完成行被采集侧的 `MIN_EXEC_TIME` 滤掉了」**" +
+			"（这类事务的 `TRX: START`、`PARAMS`、段页分配都在，唯独没有 SQL 文本）；" +
+			"次因是「语句执行中被中止」。**两者都不是采集位没开全。**"
+		next4 := "① 若采集掩码含**位 27（原始语句）**，本工具已把 `[ORA]` 行里的 SQL 自动找回来（见上方持有方明细，会标出来源）；" +
+			"② 否则复现时把 `MIN_EXEC_TIME` 调小，或直接到库上抓现场（下一步）。"
+		add("看根事务为什么能持锁这么久", fact4, note4, next4)
+	}
+
+	// ---- 第 5 步：库上抓现场 ----
+	fact5 := "日志是事后回溯，**看不到当时在等什么内部资源**。"
+	note5 := "SQL 日志只记「谁等谁的锁」，不记 latch、I/O 这类内部等待。"
+	next5 := "```sql\nSELECT * FROM V$TRXWAIT;\nSELECT SESS_ID, SQL_TEXT, TRX_ID, STATE FROM V$SESSIONS WHERE STATE = 'ACTIVE';\n```\n" +
+		"在锁等待发生期间反复抓这几个视图；另可让采集侧加**掩码位 27**（记原始语句，不受 `MIN_EXEC_TIME` 限制，代价小），" +
+		"或临时把 `MIN_EXEC_TIME` 调小（代价大：日志量会涨）。"
+	add("下次复现时在库上抓现场", fact5, note5, next5)
+
+	return out
+}
+
+// lockGuideSpan 把两个时间戳的间隔描述成人话（"3 秒内" / "40 毫秒内"）。
+func (v *statsView) lockGuideSpan(a, b string) string {
+	d := tsMillis(b) - tsMillis(a)
+	if d <= 0 {
+		return "同一时刻"
+	}
+	return fmtDur(float64(d))
+}
+
+// normalizeTpl 归一化语句模板：去掉字面量与数字，便于把"同一条语句"聚到一起。
+// 只用于「出现次数」这类形态统计，不用于任何需要精确值的场合。
+func normalizeTpl(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inStr := false
+	prevNum := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' {
+			inStr = !inStr
+			if !prevNum {
+				b.WriteByte('?')
+				prevNum = true
+			}
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			if !prevNum {
+				b.WriteByte('?')
+				prevNum = true
+			}
+			continue
+		}
+		prevNum = false
+		b.WriteByte(c)
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// lockVictim 判断一条语句模板是不是「等锁受害者」：它的累计耗时里有多大比例
+// 其实是**堵在锁上**。
+//
+// 🩸 为什么必须做这件事（V2.10，现场反馈）：报告把
+// `INSERT INTO T_IM_INV_PER_BAL_KL (FKEYCOL) VALUES (?)` 排在「优先优化」第 1 位
+// （28 次 / 累计 8.4min / 最快 500ms / 平均 18s），并建议「抓最快与最慢各跑一次
+// EXPLAIN 对比扫描方式」。用户直接质疑：**单行 INSERT 有什么可优化的？**
+// 用日志自身一对账就清楚了：
+//   - 该模板累计耗时 **505.0 s**
+//   - 该表（76196）上的锁等待累计 **505.0 s** —— **占比 100.0%**
+//   - 逐事务核对，等锁耗时与语句耗时**差值 0.00**（25.84 vs 25.84 …）
+//
+// 也就是说那 18 秒平均耗时**几乎全是等 X 锁**，语句本身是主键单行插入、快得不能再快。
+// 去 EXPLAIN 它什么也看不出来 —— **误报比不报更坏**：会让人去改没问题的写法。
+//
+// 判据：同表锁等待累计 ÷ 本模板累计耗时 ≥ 60% 即认定。
+// 返回 (比例, 命中表名)；不是受害者返回 (0, "")。
+func (v *statsView) lockVictim(sql string, sumMS float64) (float64, string) {
+	if sumMS <= 0 || len(v.LockSumByName) == 0 {
+		return 0, ""
+	}
+	tbl := stmtMainTable(sql)
+	if tbl == "" {
+		return 0, ""
+	}
+	key := strings.ToUpper(baseTableName(tbl))
+	lsum, ok := v.LockSumByName[key]
+	if !ok || lsum <= 0 {
+		return 0, ""
+	}
+	r := lsum / sumMS
+	if r > 1 {
+		r = 1 // 一次等待可能牵连多条语句，比值封顶
+	}
+	if r < 0.6 {
+		return 0, ""
+	}
+	return r, key
+}
+
+// adviseCoverPct 推荐清单覆盖的耗时占比（回答"照这个清单改，收益上限是多少"）
 func adviceCoverPct(as []adviceRow) float64 {
 	var s float64
 	for _, a := range as {
@@ -7317,6 +8775,75 @@ func renderStatsText(w io.Writer, v *statsView, opt *Options) {
 				lk.Waiters, shortTS(lk.TS))
 			fmt.Fprintf(w, "        模式 %-3s  %s\n", lk.Mode, lockTraceCmd(lk))
 		}
+		// 阻塞链（V2.8）：终端只给前 3 条 —— 够截图看清"谁堵了谁"，
+		// 完整清单在 HTML 报告的「阻塞链」一节。
+		if len(v.LockChains) > 0 {
+			n := len(v.LockChains)
+			if n > 3 {
+				n = 3
+			}
+			fmt.Fprintf(w, "  阻塞链 Top%d（一条链 = 一个根事务堵住的一串等待；共 %d 条）\n", n, len(v.LockChains))
+			fmt.Fprintf(w, "    %s %s %s %s %s %s\n",
+				lpad("#", 3), pad("对象", 26), pad("根事务（真正持锁者）", 24), lpad("最长等待", 10),
+				lpad("等待次数", 8), lpad("链长", 6))
+			for i, c := range v.LockChains[:n] {
+				fmt.Fprintf(w, "    %s %s %s %s %s %s\n",
+					lpad(strconv.Itoa(i+1), 3), pad(clip(lockObj(c.Table, c.TableID), 26), 26),
+					pad(clip(c.Root+" "+c.RootUser, 24), 24), lpad(fmtDur(c.MaxMS), 10),
+					lpad(fmtInt(c.Count), 8), lpad(strconv.Itoa(c.ChainLen), 6))
+			}
+		}
+		// 排查方向（V2.11）：终端给完整步骤 —— 这是现场真正照着做的部分，
+		// 截断它等于把最该看的东西藏起来。步骤本身只有 3~5 条，占不了几行。
+		if len(v.LockGuide) > 0 {
+			fmt.Fprintf(w, "  排查方向（按日志能证实的顺序，逐条缩小范围）\n")
+			for _, g := range v.LockGuide {
+				fmt.Fprintf(w, "    %d) %s\n", g.Step, g.Title)
+				if g.Fact != "" {
+					fmt.Fprintf(w, "       实测：%s\n", wrapIndent(oneLine(g.Fact), 11, 96))
+				}
+				if g.Note != "" {
+					fmt.Fprintf(w, "       推断：%s\n", wrapIndent(oneLine(g.Note), 11, 96))
+				}
+				if g.Next != "" {
+					fmt.Fprintf(w, "       往哪查：%s\n", wrapIndent(oneLine(g.Next), 11, 96))
+				}
+			}
+		}
+		// 双方 SQL（V2.8）：只给最久的 3 条，明细全在 HTML。
+		if n := minInt(len(v.LockRowsAll), 3); n > 0 {
+			fmt.Fprintf(w, "  锁等待双方的 SQL（Top%d；等待方取到 %d/%d，持有方取到 %d/%d，明细见 HTML 报告）\n",
+				n, v.LockWaiterSQLN, v.LockTotalN, v.LockHolderSQLN, v.LockTotalN)
+			for i, lk := range v.LockRowsAll[:n] {
+				fmt.Fprintf(w, "    #%d 等待 %s  %s\n", i+1, fmtDur(lk.MS), lockObj(lk.Table, lk.TableID))
+				if lk.WaiterSQL != "" {
+					fmt.Fprintf(w, "      等待方 trx[%s]：%s\n", lk.Waiter, clip(lk.WaiterSQL, 110))
+				} else {
+					fmt.Fprintf(w, "      等待方 trx[%s]：语句只见开始、无完成行（非「没执行」）\n", lk.Waiter)
+				}
+				root := lk.HolderRoot
+				if root == "" {
+					root = lk.Holder
+				}
+				if len(lk.HolderStmts) > 0 {
+					src := ""
+					if lk.HolderSQLFromORA {
+						src = "   ← 来源：掩码 27 的 [ORA] 原始语句行（该语句执行很快，完成行被 MIN_EXEC_TIME 滤掉了）"
+					}
+					fmt.Fprintf(w, "      持有方 trx[%s]：%s%s\n", root, clip(lk.HolderStmts[0].SQL, 110), src)
+				} else {
+					act := "结局未知（日志里未见 COMMIT/ROLLBACK）"
+					if lk.HolderKind == "ROLLBACK" {
+						act = "结局：回滚"
+					} else if lk.HolderKind == "COMMIT" {
+						act = "结局：提交"
+					}
+					fmt.Fprintf(w, "      持有方 trx[%s]：日志里没有它的 SQL 文本；%s\n", root, act)
+					io.WriteString(w, "        （成因通常是「语句很快、完成行被 MIN_EXEC_TIME 滤掉」或「执行中被中止」，"+
+						"都不是没执行；开掩码位 27 可自动找回前者）\n")
+				}
+			}
+		}
 		fmt.Fprintf(w, "  被争抢的表 Top%d（按累计等待）\n", len(v.LockTables))
 		fmt.Fprintf(w, "    %s %s %s %s %s %s\n",
 			pad("对象", 26), lpad("次数", 8), lpad("累计等待", 10), lpad("最长", 9), pad("锁模式", 8), pad("等待方用户", 24))
@@ -7788,6 +9315,92 @@ func renderStatsMarkdown(w io.Writer, v *statsView, opt *Options) {
 		}
 		fmt.Fprintln(w)
 
+		// 阻塞链 + 双方 SQL（V2.8）：与 HTML 同一份数据，这里给 Markdown 版
+		if len(v.LockChains) > 0 {
+			fmt.Fprintf(w, "### 阻塞链 Top%d\n\n> 一条链 = 一个根事务堵住的一串等待。"+
+				"**链越长越该先动根事务** —— 它的持锁时长就是后面所有人的等待时长。\n"+
+				"（根事务 = 日志 `trx[…]` 列表的第一个；日志在队列过长时会截断成 `...more`。）\n\n", len(v.LockChains))
+			fmt.Fprintf(w, "| # | 对象 | 根事务（真正持锁者） | 根事务用户 | 最长等待 | 等待次数 | 链长 | 波及时段 | 等待方用户 |\n"+
+				"|---:|---|---|---|---:|---:|---:|---|---|\n")
+			for i, c := range v.LockChains {
+				fmt.Fprintf(w, "| %d | %s | `%s` | %s | %s | %s | %d | %s | %s |\n",
+					i+1, mdEsc(lockObj(c.Table, c.TableID)), c.Root, mdEsc(dash(c.RootUser)),
+					fmtDur(c.MaxMS), fmtInt(c.Count), c.ChainLen, c.Span, mdEsc(strings.Join(c.WaiterUsers, " ")))
+			}
+			fmt.Fprintln(w)
+		}
+		if len(v.LockRowsAll) > 0 {
+			if len(v.LockGuide) > 0 {
+				io.WriteString(w, "### 排查方向（按日志能证实的顺序，逐条缩小范围）\n\n"+
+					"> 每一步先给**日志能证实的事实**，再给怎么读，最后给往哪儿查。"+
+					"标了**推断**的地方是形态推断 —— 日志能证明现象，**证明不了原因**。\n\n")
+				for _, g := range v.LockGuide {
+					fmt.Fprintf(w, "**%d. %s**\n\n", g.Step, g.Title)
+					if g.Fact != "" {
+						fmt.Fprintf(w, "- **实测**：%s\n", oneLine(g.Fact))
+					}
+					if g.Note != "" {
+						fmt.Fprintf(w, "- **推断**：%s\n", oneLine(g.Note))
+					}
+					if g.Next != "" {
+						fmt.Fprintf(w, "- **往哪查**：%s\n", oneLine(g.Next))
+					}
+					io.WriteString(w, "\n")
+				}
+			}
+			fmt.Fprintf(w, "### 锁等待双方的 SQL（全量 %d 条）\n\n> 等待方 SQL 取到 **%d/%d**，持有方 SQL 取到 **%d/%d**。"+
+				"取不到**不是解析问题、也不是采集位没开全**：**最常见成因是「语句执行很快、执行完成行被 `MIN_EXEC_TIME` 滤掉了」**"+
+				"（133 构造实验实测），次因是「语句执行中被中止」；两者都不是「没执行」。"+
+				"若采集掩码含**位 27（原始语句）**，本工具会自动从 `[ORA]` 行把 SQL 找回并标出来源；"+
+				"否则复现时抓 `V$SESSIONS.SQL_TEXT` / `V$TRXWAIT`。\n\n",
+				v.LockTotalN, v.LockWaiterSQLN, v.LockTotalN, v.LockHolderSQLN, v.LockTotalN)
+			for i, lk := range v.LockRowsAll {
+				root := lk.HolderRoot
+				if root == "" {
+					root = lk.Holder
+				}
+				fmt.Fprintf(w, "**#%d　等待 %s　%s　%s 锁　%s**\n\n", i+1, fmtDur(lk.MS),
+					mdEsc(lockObj(lk.Table, lk.TableID)), lk.Mode, shortTS(lk.TS))
+				if lk.WaiterSQL != "" {
+					fmt.Fprintf(w, "- 等待方 `trx[%s]`（%s）：`%s`\n", lk.Waiter, mdEsc(dash(lk.WaiterU)),
+						strings.ReplaceAll(clipCell(lk.WaiterSQL, 400), "`", "'"))
+				} else {
+					fmt.Fprintf(w, "- 等待方 `trx[%s]`：语句只见开始、没有完成行（非「没执行」）\n", lk.Waiter)
+				}
+				if len(lk.HolderStmts) > 0 {
+					for _, sm := range lk.HolderStmts {
+						src := ""
+						if lk.HolderSQLFromORA {
+							src = "（**来源：掩码 27 的 `[ORA]` 原始语句行** —— 该语句执行很快，完成行被 `MIN_EXEC_TIME` 滤掉了）"
+						}
+						fmt.Fprintf(w, "- 持有方 `trx[%s]`（链首）：[%s] `%s` %s\n", root, sm.Op,
+							strings.ReplaceAll(clipCell(sm.SQL, 400), "`", "'"), src)
+					}
+				} else {
+					fmt.Fprintf(w, "- 持有方 `trx[%s]`（链首）：日志里没有它的 SQL 文本。成因通常是"+
+						"「**语句执行很快、完成行被 `MIN_EXEC_TIME` 滤掉**」或「执行中被中止」"+
+						"—— 都不是「没执行」；若采集掩码含位 27（原始语句），本工具会自动找回前者\n", root)
+				}
+				act := "结局未知（日志里未见 COMMIT/ROLLBACK）"
+				switch lk.HolderKind {
+				case "ROLLBACK":
+					act = "结局：**回滚**（" + shortTS(lk.HolderEndTS) + "）"
+				case "COMMIT":
+					act = "结局：**提交**（" + shortTS(lk.HolderEndTS) + "）"
+				}
+				if lk.HolderKind != "" {
+					fmt.Fprintf(w, "- %s\n", act)
+				} else {
+					fmt.Fprintf(w, "- %s\n", act)
+				}
+				if len(lk.Chain) > 1 {
+					fmt.Fprintf(w, "- 排队：`trx[%s]` 后面还有 **%d** 个事务（%s）\n",
+						root, len(lk.Chain)-1, mdEsc(strings.Join(lk.Chain[1:], ", ")))
+				}
+				fmt.Fprintln(w)
+			}
+		}
+
 		fmt.Fprintf(w, "### 被争抢的表 Top%d（按累计等待）\n\n| 对象 | 次数 | 累计等待 | 最长 | 锁模式 | 等待方用户 | 最长一次发生在 |\n|---|---:|---:|---:|---|---|---|\n", len(v.LockTables))
 		for _, r := range v.LockTables {
 			fmt.Fprintf(w, "| %s | %s | %s | %s | %s | %s | %s |\n",
@@ -7921,6 +9534,9 @@ h3{font-size:14px;margin:16px 0 6px;color:#334155}
 .kpi.risk{border-left:3px solid var(--line)}
 .kpi.na{background:#f8fafc;border-style:dashed;border-color:#cbd5e1}
 .kpi.na b{color:#94a3b8}
+.kpinote{margin:2px 0 10px;padding:7px 11px;background:#fffbeb;border:1px solid #fcd34d;
+  border-left:3px solid var(--amber);border-radius:6px;font-size:12.5px;line-height:1.6;color:#92400e}
+.kpinote code{background:#fff7ed;padding:1px 5px;border-radius:4px}
 .hl{background:#fffbeb;border:1px solid #fcd34d;border-left:4px solid var(--amber);border-radius:6px;
     padding:8px 12px;margin:0 0 10px;font-size:13px;color:#92400e}
 .hl.info{background:#eff6ff;border-color:#bfdbfe;border-left-color:var(--blue);color:#1e40af}
@@ -7988,6 +9604,27 @@ footer{margin-top:34px;color:var(--dim);font-size:12px;border-top:1px solid var(
 .advr{background:#334155;color:#fff;border-radius:5px;min-width:21px;height:21px;line-height:21px;text-align:center;font-size:12px;font-weight:600;padding:0 5px}
 .adv.prio1 .advr{background:#dc2626}
 .adv.prio2 .advr{background:#f59e0b}
+/* 「等锁」用另一个色系：它不是"优先级更高的 SQL"，而是"这一类根本不该去改 SQL"——
+   颜色区分开，读者才不会把它当成"最该优化的那条"。 */
+.adv.prio3{border-left-color:#7c3aed;background:#f5f3ff}
+.adv.prio3 .advr{background:#7c3aed}
+.adv.prio3 .advp{background:#7c3aed;color:#fff}
+/* 「锁等待排查方向」（V2.11）：把散在几十张卡片里的结论汇总成一条可执行的排查路径。
+   视觉上做成"步骤流"，与上面的数据表区分开 —— 它是要照着做的，不是要读的。 */
+.guide{margin:10px 0}
+.gstep{background:var(--card);border:1px solid var(--line);border-left:3px solid #0891b2;
+  border-radius:8px;padding:10px 13px;margin:9px 0}
+.gst{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--ink);margin-bottom:6px}
+.gsn{background:#0891b2;color:#fff;border-radius:5px;min-width:20px;height:20px;line-height:20px;
+  text-align:center;font-size:12px;padding:0 5px;flex:0 0 auto}
+.gf,.gn,.gx{font-size:13px;line-height:1.65;margin:3px 0;color:var(--ink)}
+.gf b{color:#0e7490}
+.gn{color:var(--dim)}
+.gn b{color:#b45309}
+.gx b{color:#15803d}
+.gstep code{background:var(--code-bg,rgba(127,127,127,.14));padding:0 4px;border-radius:3px;font-size:12px}
+.gstep pre{background:var(--code-bg,rgba(127,127,127,.14));padding:8px 10px;border-radius:6px;
+  overflow-x:auto;font-size:12px;margin:5px 0}
 .advp{font-size:12px;font-weight:600;padding:1px 8px;border-radius:10px;background:#e2e8f0;color:#334155}
 .adv.prio1 .advp{background:#dc2626;color:#fff}
 .adv.prio2 .advp{background:#f59e0b;color:#fff}
@@ -8007,12 +9644,41 @@ table.fold.open tbody tr.hid{display:table-row}
   border:1px solid var(--line);background:#fff;color:#475569;cursor:pointer;white-space:nowrap}
 .foldbar button:hover{border-color:var(--blue);color:var(--blue)}
 .foldbar .fnote{flex:1}
+/* 锁等待双方 SQL 卡片（V2.8）：一张卡 = 一次锁等待 */
+.lkcard{background:var(--card);border:1px solid var(--line);border-radius:8px;margin:8px 0;overflow:hidden}
+.lkcard.hid{display:none}
+.lkcards.open .lkcard.hid{display:block}
+.lkhead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding:7px 12px;
+  background:#f8fafc;border-bottom:1px solid var(--line);font-size:12.5px}
+.lkidx{font-weight:700;color:var(--blue)}
+.lkwait{font-weight:700;color:#b45309}
+.lktbl{color:#334155}
+.lkmode{color:var(--dim)}
+.lkts{margin-left:auto;color:var(--dim)}
+.lkbody{display:grid;grid-template-columns:1fr 1fr;gap:0}
+.lkside{padding:9px 12px;min-width:0}
+.lkside+.lkside{border-left:1px dashed var(--line)}
+.lksideh{font-size:12px;color:var(--dim);margin-bottom:6px}
+.lkcard code{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:12px;
+  background:#f1f5f9;padding:1px 5px;border-radius:4px;word-break:break-all}
+.lksql{margin:4px 0;line-height:1.6}
+.lkop{font:600 11px/1 "Cascadia Mono",Consolas,monospace;color:#0369a1;background:#e0f2fe;
+  padding:2px 5px;border-radius:4px;margin-right:4px}
+.lkdur{color:var(--dim);font-size:11.5px;margin-left:5px}
+.lkora{font-size:12px;color:#1e40af;background:#eff6ff;border-left:3px solid #3b82f6;padding:6px 9px;border-radius:4px;margin-top:6px;line-height:1.6}
+.lkmiss{font-size:12px;color:#92400e;background:#fffbeb;border-left:3px solid var(--amber);
+  border-radius:0 5px 5px 0;padding:6px 9px;line-height:1.6}
+.lkend{margin-top:6px;font-size:12px;color:#334155}
+@media (max-width:820px){.lkbody{grid-template-columns:1fr}
+  .lkside+.lkside{border-left:none;border-top:1px dashed var(--line)}}
 @media print{body{background:#fff;padding:0}.card,table,.hint{break-inside:avoid}h2{break-after:avoid}
 
   .tbh .tbhint,.tbh button{display:none}.csvh .ops{display:none}.csvh .tx .hintcp{display:none}.chart{break-inside:avoid}
   /* 打印/导出 PDF 时自动全展开：折叠只是屏读时的减法，不能影响归档件 */
   table.fold tbody tr.hid{display:table-row}
-  .foldbar{display:none}}
+  .foldbar{display:none}
+  .lkcard.hid{display:block}
+  .lkcards .lkcard{break-inside:avoid}}
 </style>
 `
 
@@ -8324,6 +9990,87 @@ type hBar struct {
 }
 
 // hEsc HTML 转义
+// oneLine 把文案压成单行：去掉换行（终端里用 wrapIndent 自己折）、
+// 去掉 Markdown 的粗体/代码标记（终端不渲染，留着反而占宽度）。
+func oneLine(s string) string {
+	// 先摘掉代码围栏：去掉反引号后会剩下个孤零零的 "sql"
+	s = strings.ReplaceAll(s, "```sql", " ")
+	s = strings.ReplaceAll(s, "```", " ")
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "`", "")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// wrapIndent 按「显示宽度」折行留白：中文算 2 列，ASCII 算 1 列。
+// 终端里 long line 折行后没有缩进，会与下一条挤在一起 —— 这里手工折，
+// 保证续行也带缩进，读起来连成一整段。
+func wrapIndent(s string, indent, width int) string {
+	pad := strings.Repeat(" ", indent)
+	var b strings.Builder
+	col := 0
+	line := 0
+	for _, r := range s {
+		w := 1
+		if r > 0x2E80 { // 粗略：CJK 及全角符号占两列
+			w = 2
+		}
+		if col+w > width-indent {
+			b.WriteString("\n")
+			b.WriteString(pad)
+			col = 0
+			line++
+		}
+		b.WriteRune(r)
+		col += w
+	}
+	_ = line
+	return b.String()
+}
+
+// mdInline 把诊断文案里的 **粗体** 与 `等宽` 转成 HTML。
+//
+// 输入是工具自己生成的受限 Markdown（只有这两种标记），所以不需要完整解析器；
+// 但**必须先转义 HTML** —— 文案里含 `V$SESSIONS`、`<` 之类字符，
+// 不转义会破坏页面结构（这类"文本里有尖括号"的坑在报告里踩过）。
+func mdInline(s string) string {
+	s = hEsc(s)
+	var b strings.Builder
+	b.Grow(len(s) + 32)
+	strong, code := false, false
+	for i := 0; i < len(s); {
+		switch {
+		case !code && strings.HasPrefix(s[i:], "**"):
+			if strong {
+				b.WriteString("</b>")
+			} else {
+				b.WriteString("<b>")
+			}
+			strong = !strong
+			i += 2
+		case !strong && s[i] == '`':
+			if code {
+				b.WriteString("</code>")
+			} else {
+				b.WriteString("<code>")
+			}
+			code = !code
+			i++
+		default:
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	// 标记没配平时补上收尾，避免留下未闭合标签
+	if strong {
+		b.WriteString("</b>")
+	}
+	if code {
+		b.WriteString("</code>")
+	}
+	return b.String()
+}
+
 func hEsc(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#39;")
 	return r.Replace(s)
@@ -8491,19 +10238,15 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 	kpi("参数还原率", fmt.Sprintf("%.2f%%", v.RestorePct), "")
 	if v.SpanSec > 0 {
 		// 🩸 KPI 上的 QPS 最容易被误读：33 条/秒 与 4,933 事务/秒 并排，读者会以为
-		// 系统很闲。QPS 偏低时标签直接写明「日志记到的语句数」，并在 TPS 上标注按
-		// COMMIT 计 —— 卡片本身就能自证口径，不依赖读者去下文找警告条。
-		qpsHint := ""
-		if v.qpsUnderReported() {
-			qpsHint = "（日志记到的语句数，非真实吞吐）"
-		}
-		kpi("平均 QPS", fmtNum(v.AvgQPS)+qpsHint, " 条/秒")
-		kpi("峰值 QPS", fmtNum(v.PeakQPS)+qpsHint, " 条/秒")
-		tpsHint := ""
+		// 系统很闲。卡片本身太窄（minmax(124px,1fr) + ellipsis），把口径塞进数值或
+		// 标签都会被截断成「33（日志…」——等于没说。所以：
+		//   · 卡片保持干净：只放数字 + 短标签（给「读数」用）
+		//   · 口径写在卡片下方的 kpinote（给「判读」用），宽度不受限、不会被截
+		kpi("平均 QPS", fmtNum(v.AvgQPS), " 条/秒")
+		kpi("峰值 QPS", fmtNum(v.PeakQPS), " 条/秒")
 		if v.Commits+v.Rollbacks > 0 {
-			tpsHint = "（按 COMMIT）"
+			kpi("峰值 TPS", fmtNum(v.PeakTPS), " 事务/秒")
 		}
-		kpi("峰值 TPS", fmtNum(v.PeakTPS)+tpsHint, " 事务/秒")
 	}
 	if v.Commits+v.Rollbacks > 0 {
 		kpi("回滚率", fmt.Sprintf("%.2f%%", v.RollbackPct), "")
@@ -8521,6 +10264,14 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 		kpi("已排除(-E)", fmtInt(v.Excluded), " 条")
 	}
 	io.WriteString(w, "</div>\n")
+	// KPI 下方的口径注（不放进卡片：卡片窄、会截断，见上方注释）。
+	// 只在真会误读时出现，避免每份报告都挂一条没信息量的注。
+	if v.SpanSec > 0 && v.qpsUnderReported() {
+		fmt.Fprintf(w, "<div class=\"kpinote\">⚠ 上面两个 QPS 是<b>日志记到的语句数</b>，不是业务真实吞吐"+
+			"（本批有事务结束事件 %s 条，却只记到 SQL 语句 %s 条）—— <b>不要与 TPS 横向比较</b>；"+
+			"TPS 按 <code>COMMIT</code> 计数。详见下文「吞吐与时轴」。</div>\n",
+			fmtInt(v.Commits+v.Rollbacks), fmtInt(v.Exec))
+	}
 
 	// 通用表格 / 条形图辅助
 	//
@@ -8641,6 +10392,8 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 				cls = "adv prio1"
 			} else if a.Prio == "次之" {
 				cls = "adv prio2"
+			} else if a.Prio == "等锁" {
+				cls = "adv prio3"
 			}
 			fmt.Fprintf(w, "<div class=\"%s\">\n", cls)
 			fmt.Fprintf(w, "<div class=\"advh\"><span class=\"advr\">%d</span>"+
@@ -8649,8 +10402,8 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 				"<span class=\"advm\">%s 次 · 最快 %s / 平均 %s / 最大 %s · 累计 %s</span></div>\n",
 				a.Rank, hEsc(a.Prio), a.Share*100, fmtInt(a.Count),
 				durOrDash(a.Min), fmtDur(a.Avg), fmtDur(a.Max), fmtDur(a.Sum))
-			fmt.Fprintf(w, "<div class=\"advg\"><b>问题信号：</b>%s</div>\n", hEsc(a.Signal))
-			fmt.Fprintf(w, "<div class=\"advg\"><b>建议动作：</b>%s</div>\n", hEsc(a.Action))
+			fmt.Fprintf(w, "<div class=\"advg\"><b>问题信号：</b>%s</div>\n", mdInline(a.Signal))
+			fmt.Fprintf(w, "<div class=\"advg\"><b>建议动作：</b>%s</div>\n", mdInline(a.Action))
 			fmt.Fprintf(w, "<div class=\"advq\">%s</div>\n", sqlCell(a.Sample, 110))
 			io.WriteString(w, "</div>\n")
 		}
@@ -8982,6 +10735,70 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 			hTableFold([]string{"#", "等待时长", "锁模式", "对象", "等待方（trxid / 用户）", "持有方（谁在持锁）", "被等事务数", "时间"},
 				[]string{"n", "n", "", "", "c", "c", "n", ""}, rows2, nil, foldKeep)
 		}
+
+		// ---- 阻塞链（V2.8）----
+		//
+		// 锁行的持有方列表是**累计排队**的：`wait for 7 trxs, trx[A, B, C …]`，
+		// A 才是真正持锁的，B、C… 全堵在 A 后面。按「表 + 链首」聚起来看，
+		// 一眼就知道是"一个慢事务拖住一串人"还是"多处在互相等"。
+		if chains := v.LockChains; len(chains) > 0 {
+			fmt.Fprintf(w, "<h3>阻塞链 Top%d（一条链 = 一个根事务堵住的一串等待）</h3>\n", len(chains))
+			io.WriteString(w, "<div class=\"note\">口径：把同表、同根事务的等待并成一条链。"+
+				"<b>链越长越该先动根事务</b> —— 它的持锁时长就是后面所有人的等待时长。"+
+				"（根事务 = 日志 <code>trx[…]</code> 列表里的第一个；日志在队列过长时会截断成 <code>...more</code>。）</div>\n")
+			var rowsC [][]string
+			for i, c := range chains {
+				rowsC = append(rowsC, []string{strconv.Itoa(i + 1), lockObj(c.Table, c.TableID),
+					c.Root, c.RootUser, fmtDur(c.MaxMS), fmtInt(c.Count),
+					strconv.Itoa(c.ChainLen), c.Span, strings.Join(c.WaiterUsers, " ")})
+			}
+			hTableFold([]string{"#", "对象", "根事务（真正持锁者）", "根事务用户", "最长等待", "等待次数", "链长（排队事务数）", "波及时段", "等待方用户"},
+				[]string{"n", "", "c", "", "n", "n", "n", "", ""}, rowsC, nil, foldKeep)
+		}
+
+		// ---- 排查方向（V2.11）----
+		//
+		// 🩸 为什么要有这一节（现场提问）：报告把根事务的「结局」（提交/回滚）都列出来了，
+		// 读者下一句必然问「都是回滚，那我往哪儿查？」。这些信息分散在几十张卡片里，
+		// 得自己横着看才能拼出结论 —— 那是报告该替他做的事。
+		if len(v.LockGuide) > 0 {
+			io.WriteString(w, "<h3>排查方向（按日志能证实的顺序，逐条缩小范围）</h3>\n")
+			io.WriteString(w, "<div class=\"note\">每一步先给<b>日志能证实的事实</b>，再给怎么读，最后给往哪儿查。"+
+				"标了<b>推断</b>的地方是形态推断 —— 日志能证明现象，<b>证明不了原因</b>，"+
+				"原因要到对应的位置（多半是应用侧）确认。</div>\n")
+			io.WriteString(w, "<div class=\"guide\">\n")
+			for _, g := range v.LockGuide {
+				fmt.Fprintf(w, "<div class=\"gstep\"><div class=\"gst\"><span class=\"gsn\">%d</span>%s</div>\n",
+					g.Step, hEsc(g.Title))
+				if g.Fact != "" {
+					fmt.Fprintf(w, "<div class=\"gf\"><b>实测：</b>%s</div>\n", mdInline(g.Fact))
+				}
+				if g.Note != "" {
+					fmt.Fprintf(w, "<div class=\"gn\"><b>推断：</b>%s</div>\n", mdInline(g.Note))
+				}
+				if g.Next != "" {
+					fmt.Fprintf(w, "<div class=\"gx\"><b>往哪查：</b>%s</div>\n", mdInline(g.Next))
+				}
+				io.WriteString(w, "</div>\n")
+			}
+			io.WriteString(w, "</div>\n")
+		}
+
+		// ---- 双方 SQL 明细（V2.8）----
+		//
+		// 这一节才是现场真正要的："哪条 SQL 在持锁、哪条 SQL 被卡住"。
+		// 取不到语句时**必须说清是「没采到」还是「没跑」** —— 沿用 V2.4 起的一贯原则。
+		if len(v.LockRowsAll) > 0 {
+			fmt.Fprintf(w, "<h3>锁等待双方的 SQL（全量 %d 条，默认显示前 %d 条）</h3>\n", v.LockTotalN, foldKeep)
+			fmt.Fprintf(w, "<div class=\"note\">等待方 SQL 取到 <b>%d/%d</b>，持有方 SQL 取到 <b>%d/%d</b>。"+
+				"取不到<b>不是解析问题、也不是采集位没开全</b>：<b>最常见成因是「语句执行很快、"+
+				"执行完成行被 <code>MIN_EXEC_TIME</code> 滤掉了」</b>（133 构造实验实测），"+
+				"次因是「语句执行中被中止」；两者都不是「没执行」。"+
+				"若采集掩码含<b>位 27（原始语句）</b>，本工具会自动从 <code>[ORA]</code> 行把 SQL 找回并标出来源；"+
+				"否则复现时抓 <code>V$SESSIONS.SQL_TEXT</code> / <code>V$TRXWAIT</code>。</div>\n",
+				v.LockWaiterSQLN, v.LockTotalN, v.LockHolderSQLN, v.LockTotalN)
+			hLockCards(w, v.LockRowsAll, foldKeep)
+		}
 		if len(v.LockTables) > 0 {
 			fmt.Fprintf(w, "<h3>被争抢的表 Top%d（按累计等待）</h3>\n", len(v.LockTables))
 			var rows3 [][]string
@@ -9074,9 +10891,11 @@ func renderStatsHTML(w io.Writer, v *statsView, opt *Options) {
 			"库上执行 <code>SELECT PARA_NAME, PARA_VALUE FROM V$DM_SQLLOG_CONFIG;</code> 可核对。</div>\n")
 		var rows [][]string
 		for _, r := range cr {
-			rows = append(rows, []string{r.Item, r.Value, r.Advice})
+			// 用 "r" 列（原样输出安全 HTML）：结论里带 **粗体** / `等宽`，
+			// 走默认列会被 hEsc 转义、把标记原样显示出来。
+			rows = append(rows, []string{hEsc(r.Item), hEsc(r.Value), mdInline(r.Advice)})
 		}
-		hTable([]string{"检查项", "实测", "结论 / 怎么改"}, []string{"", "", ""}, rows, nil)
+		hTable([]string{"检查项", "实测", "结论 / 怎么改"}, []string{"r", "r", "r"}, rows, nil)
 	}
 
 	// ---- 判读提示 ----
@@ -9899,11 +11718,20 @@ func buildExcelSheets(v *statsView, opt *Options) []*xlSheet {
 			case share >= 0.03:
 				prio = "次之"
 			}
+			// 🩸 与 HTML/终端/MD 保持同一口径（V2.10）：等锁受害者不算「优化对象」。
+			// 原先这里自己按占比重算优先级，于是同一份交付件里
+			// Excel 显示「优先」、HTML 显示「等锁」—— 两个视图打架。
+			if ratio, _ := v.lockVictim(r.Sample, r.Sum); ratio > 0 {
+				prio = "等锁"
+			}
 			s.add(xi(int64(i+1)), xn(r.Sum), xi(r.Count), xn(r.Min), xn(r.Avg), xn(r.Max),
 				xp(share), xc(prio), xq(r.Sample))
 		}
 		s.blank()
 		s.add(xnote("优先级规则：该模板累计耗时 ÷ 本次语句总耗时（" + fmtDur(totalMS) + "）≥10% 记「优先」，3%~10% 记「次之」，其余「一般」。"))
+		s.add(xnote("「等锁」= 这条语句的累计耗时基本就是堵在某张表的锁上（同表锁等待累计 ≥ 该模板累计的 60%）。" +
+			"此时**改 SQL 没有收益、EXPLAIN 也看不出问题** —— 单行 INSERT / 等值 UPDATE 本身不慢；" +
+			"要动的是长时间持锁的**根事务**（见「锁等待」表）。"))
 		s.add(xnote("同一模板的语句已合并（字面量与数字归一化），所以「执行次数」是这类语句出现的总次数 —— 次数多且平均高，通常是缺索引或写法问题。"))
 		s.add(xnote("「最快」列与「平均」对比着看：两者接近 = 稳定慢（缺索引/写法问题，改了就好）；最快远小于平均 = 时快时慢（计划突变、数据倾斜或偶发锁等待），先查为什么不稳定。"))
 		s.add(xnote("样例列是该模板参数还原后的一条真实语句，可直接复制到 disql 执行 EXPLAIN 看计划。行数由 -p 控制，加大即可获得更长清单。"))
@@ -10011,6 +11839,49 @@ func buildExcelSheets(v *statsView, opt *Options) []*xlSheet {
 				}
 				s.blank()
 				s.add(xnote("持有方用户靠「事务号 → 用户」反查（日志的锁行只带等待方的会话信息），查不到显示为空。"))
+			}
+			if len(v.LockRowsAll) > 0 {
+				s.section(fmt.Sprintf("锁等待双方的 SQL（V2.8；全量 %d 条，等待方 SQL 可得 %d / 持有方可得 %d）",
+					v.LockTotalN, v.LockWaiterSQLN, v.LockHolderSQLN))
+				s.head("#", "等待(ms)", "对象", "等待方 trxid", "等待方 SQL（参数已还原）",
+					"持有方 trxid（链首）", "持有方结局", "持有方 SQL（该事务在日志里的语句）", "链长", "")
+				for i, lk := range v.LockRowsAll {
+					root := lk.HolderRoot
+					if root == "" {
+						root = lk.Holder
+					}
+					wsql := lk.WaiterSQL
+					if wsql == "" {
+						wsql = "（日志里没有可用 SQL 文本 —— 常见成因：语句很快被 MIN_EXEC_TIME 滤掉，或执行中被中止；都不是没执行）"
+					} else {
+						wsql = "[" + lk.WaiterOp + "] " + clipCell(wsql, 800)
+					}
+					hsql := "（日志里没有可用 SQL 文本 —— 常见成因：语句很快被 MIN_EXEC_TIME 滤掉，或执行中被中止；都不是没执行）"
+					if len(lk.HolderStmts) > 0 {
+						parts := make([]string, 0, len(lk.HolderStmts))
+						for _, sm := range lk.HolderStmts {
+							parts = append(parts, "["+sm.Op+"] "+clipCell(sm.SQL, 400))
+						}
+						hsql = strings.Join(parts, "  |  ")
+						if lk.HolderSQLFromORA {
+							hsql += "   ← 来源：[ORA] 原始语句行（掩码 27）；该语句执行很快，完成行被 MIN_EXEC_TIME 滤掉"
+						}
+					}
+					kind := "未见 COMMIT/ROLLBACK"
+					switch lk.HolderKind {
+					case "ROLLBACK":
+						kind = "回滚 " + shortTS(lk.HolderEndTS)
+					case "COMMIT":
+						kind = "提交 " + shortTS(lk.HolderEndTS)
+					}
+					s.add(xi(int64(i+1)), xn(lk.MS), xc(lockObj(lk.Table, lk.TableID)),
+						xc(nz(lk.Waiter)), xc(wsql), xc(nz(root)), xc(kind), xc(hsql),
+						xi(int64(len(lk.Chain))), xc(""))
+				}
+				s.blank()
+				s.add(xnote("「持有方」取日志 trx[…] 列表的第一个 = 真正的持锁者，其余是排在它后面的等待者。" +
+					"持有方 SQL 缺失不等于「没执行」：最常见成因是「语句执行很快、完成行被 MIN_EXEC_TIME 滤掉」" +
+					"（133 构造实验实测），次因是「执行中被中止」；掩码含位 27 时本工具会自动从 [ORA] 行找回并标出来源。"))
 			}
 			if len(v.LockTables) > 0 {
 				s.section(fmt.Sprintf("被争抢的表 Top%d（按累计等待）", len(v.LockTables)))
@@ -10297,6 +12168,21 @@ func isTerminal(f *os.File) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
+// watchStreams 决定 watch 的「数据」与「诊断」分别写到哪个流。
+//
+//	数据（记录本身）→ 永远 stdout：`dmsqlq watch … | grep x`、`> run.log` 拿到的都是干净的数据流；
+//	诊断（横幅 / 表头 / 切换提示 / 汇总）→ stdout 是终端时也走 stdout（观感与以前完全一致），
+//	  一旦 stdout 被重定向或接管道，就改走 stderr —— 否则 `| head -3` 的配额会被横幅吃掉、
+//	  `> run.log` 里会混进表头和汇总。
+//
+// 判据用 isTerminal（字符设备）：Windows 控制台是字符设备，管道是 ModeNamedPipe，普通文件是普通文件。
+func watchStreams() (data, diag io.Writer) {
+	if isTerminal(os.Stdout) {
+		return os.Stdout, os.Stdout
+	}
+	return os.Stdout, os.Stderr
+}
+
 // waitEnterIfDoubleClick Windows 上从资源管理器双击 exe 时，控制台窗口会在进程
 // 结束的瞬间关闭，用户什么都来不及看（dmmem-go 明确记录过这个体验坑）。
 //
@@ -10345,4 +12231,2522 @@ func (o *Options) ExtraNote() string {
 		return fmt.Sprintf("（--top-ms：仅导出最慢 %d 条）", o.topMS)
 	}
 	return ""
+}
+
+// ═══════════════════════════════════════════════════════════════════ 实时监视（watch）
+//
+//   dmsqlq watch [目录或日志文件] [选项]
+//
+// 场景：想知道「点一下 DM 管理工具（manager.exe）的界面，它到底跑了什么 SQL」。
+// 做法：跟随 sqllog.ini 指定的 SQL 日志目录，尾部增量读；每次轮询重扫目录，
+//       出现更新的日志文件就切过去（SWITCH_MODE=2 是「按文件大小切换」，
+//       新文件名自带时间戳），文件被截断/重建也能识别。
+//
+// 与批处理模式的边界：watch 有独立的参数集与独立的循环，不碰报告那条热路径；
+// 入口只在 main() 开头拦一次。
+
+const (
+	watchPollDefault  = 200 * time.Millisecond
+	watchWidthDefault = 150
+	watchMinSQLCol    = 40
+	watchSlowestKeep  = 5
+	watchHeaderEvery  = 40   // 长跑时每 N 行重印一次列标题，免得滚上去后忘了每列是什么
+	watchGapDefaultMS = 1000 // 同一批的最大间隔（毫秒）——实测一次点击带出的多条 SQL 间隔在百毫秒内
+)
+
+const (
+	clrReset  = "\x1b[0m"
+	clrDim    = "\x1b[2m"
+	clrRed    = "\x1b[31m"
+	clrGreen  = "\x1b[32m"
+	clrYellow = "\x1b[33m"
+	clrCyan   = "\x1b[36m"
+)
+
+// watchOpts 实时监视的选项（与批处理的 Options 完全分开，互不影响）
+type watchOpts struct {
+	app    string          // 只看该客户端（appname 子串，忽略大小写）
+	ops    map[string]bool // 只看这些语句类型
+	minMS  float64
+	like   string
+	all    bool   // 显示全部原始行（含 [ORA]、TRX、协议事件）
+	dirArg string // -d/--dir：显式指定日志目录（等价于位置参数）
+	pass   string // SYSDBA 口令（不给则读 $DM_PASS）
+
+	// ---- 连远端实例（V2.21）----
+	// 🩸 为什么需要：WSL2 是独立网络命名空间 + NAT，127.0.0.1 在 WSL 里指向 WSL 自己，
+	//    连不上 Windows 主机上的达梦。从 WSL 连本机库必须用「Windows 主机 IP」；
+	//    连虚拟机测试环境（192.168.16.x 等）同样要显式给地址。
+	host      string // -H/--host：达梦实例地址（默认 127.0.0.1）
+	port      string // -P/--port：达梦实例端口（默认读 dm.ini 的 PORT_NUM，否则 5236）
+	syncLog   bool   // -Y：临时把 SQL 日志改成同步刷盘，退出自动还原
+	showPaths bool   // 只列出自动找到的候选目录
+	forget    bool   // 清掉记住的目录
+	limit     int    // 输出满 N 条后退出（0 = 不限）
+	tail      int    // 启动时回放最近 N 条
+	poll      time.Duration
+	width     int
+	full      bool // SQL 不截断
+	color     bool
+	noHead    bool
+
+	// ---- 批次聚合（V2.18）----
+	gap    time.Duration // -g/--gap：同一批内两条记录的最大间隔；0 = 不聚合
+	gapSet bool          // 用户是否显式给过 -g（显式则不管终端还是管道都照办）
+	group  bool          // 是否启用批次聚合（终端默认开；重定向/接管道默认扁平）
+
+	// ---- 只要 SQL（V2.19）----
+	// 元信息行里的「耗时」是判断哪条慢的唯一线索，所以默认保留；
+	// --sql-only 给「只想把 SQL 复制出去执行」的场景（看某个界面到底发了哪些 SQL）。
+	sqlOnly bool // 只输出 SQL 原文：无元信息行/批次头/表头，不缩进、不截断
+}
+
+func watchUsage() func() {
+	return func() {
+		fmt.Fprint(os.Stdout, `dmsqlq watch ── 实时监视 SQL 日志（看客户端到底跑了什么 SQL）
+
+用法
+  dmsqlq watch [目录或日志文件] [选项]
+
+  给目录 → 自动跟随目录里最新的 dmsql_*.log；
+  给文件 → 跟随该文件，并自动切到同目录里更新的日志；
+  ★ 都不给 → 自动定位（不用记路径）：
+      ① $DMSQLQ_LOG_DIR  ② 上次用过的目录（记住）
+      ③ 扫 DM 安装目录：各盘的 \dmdbms / \dm8 / \dameng / \dmdata 等，
+         读其中 sqllog.ini 的 FILE_PATH（相对路径会逐个基准试，见下），
+         Linux 上还扫 /opt /data /usr/local /home/<用户> 下的同名目录。
+      多个候选时按「最近写过日志」挑，并在横幅里告诉你还发现了哪些、怎么换。
+
+  ★ 日志会「切换」（SQLLOG.INI 的 SWITCH_MODE=2 是按大小切，默认 128MB 一个），
+    本工具每次轮询都会重扫目录，新文件一出现就自动切过去，不用重开。
+
+常用
+  dmsqlq watch -a manager.exe
+      自动定位日志目录，只看 DM 管理工具执行的 SQL。点界面 → SQL 立刻打到屏幕上。
+
+  dmsqlq watch -a manager.exe -Y
+      同上，并把 SQL 日志临时切成同步刷盘（退出自动还原）—— 口令取 $DM_PASS。
+
+  dmsqlq watch --all
+      连准备阶段（[ORA]）、事务起止、协议事件一起看 —— 排查「一条都没打出来」时用。
+
+  dmsqlq watch --show-paths
+      只列出自动找到的候选日志目录（含各自最近活动时间），确认它找对了没有。
+
+  dmsqlq watch -d "D:\dmdbms\log" -m 100 -F
+      显式给目录，只看执行超过 100ms 的，且 SQL 整条不截断。
+
+选项
+  -a, --app <名>        只看该客户端（appname 字段，子串匹配，忽略大小写；默认全部）
+  -k, --op <类型列表>   只看这些语句类型，逗号分隔（SEL,INS,UPD,DEL,DML,DDL,CAL,ERR）
+  -m, --min-ms <毫秒>   只显示耗时 ≥ 该值的语句
+  -l, --like <子串>     只显示 SQL 含该子串的语句（忽略大小写）
+  -A, --all             显示全部原始行，不做「只显示已执行语句」的过滤
+  -T, --tail <条数>     启动时先回放该文件最近 N 条（默认 0：只看启动之后的新记录）
+  -n, --limit <条数>    输出满 N 条后自动退出并打印汇总（默认 0：一直跑，Ctrl-C 停）
+  -i, --interval <毫秒> 轮询间隔（默认 200，最小 20；--poll 为同义长名）
+  -g, --gap <毫秒>      同一批的最大间隔（默认 1000）—— 同一会话、且与上一条的间隔不超过
+                        它的连续记录聚成一批（点一次界面带出的十几条 SQL 会放在一起）。
+                        0 = 不聚合，输出扁平表；重定向 / 接管道时自动就是这个模式。
+      --sql-only        只输出 SQL 原文：不打印元信息行 / 批次头 / 表头，也不缩进、不截断。
+                        **每条 SQL 之间空一行** —— 一批里有的语句不带分号（日志记的是客户端
+                        发来的原文），一行挨一行会数不清是几条；批次之间空两行以示分组，
+                        配 -g 0 则没有批次概念、统一一行一条。典型用法：
+                            dmsqlq watch -a manager.exe --sql-only > click.sql
+                        空行不影响 disql 执行（脚本执行默认忽略 SQL 之间的空行）。
+  -d, --dir <目录>      显式指定日志目录（等价于位置参数）
+  -p, --pass <口令>     SYSDBA 口令；不给则读环境变量 $DM_PASS。
+  -H, --host <地址>   达梦实例地址（默认 127.0.0.1，也可用 $DM_HOST）。
+                        ★ 从 WSL 连 Windows 本机的达梦：给 WSL 的网关地址（如 172.20.240.1）。
+                        ★ 连虚拟机测试环境：给那台虚拟机的 IP（如 192.168.16.135）。
+  -P, --port <端口>    实例端口（默认读 dm.ini 的 PORT_NUM，否则 5236）。
+                        连远端库时建议显式给 —— 本机读不到远端的 dm.ini。
+                        给了口令会顺手做一次「采集配置体检」（只读）。
+  -Y, --sync-log        临时把 SQL 日志切成同步刷盘（ASYNC_FLUSH=0），
+                        退出时自动还原。★要改数据库的 sqllog.ini，需口令。
+      --show-paths      只列出自动找到的候选日志目录（含各自最近活动时间），不动
+      --forget          清掉记住的日志目录
+  -w, --width <列数>    输出总宽（默认取 $COLUMNS，否则 150）
+  -F, --full            SQL 不截断，整条原样输出
+      --color           彩色输出（Git Bash / Windows Terminal 下更好看；cmd.exe 请勿开）
+      --no-header       不打印列标题
+  -h, --help            本帮助
+
+管道（把记录再往下游过滤）
+  记录写在 stdout；诊断信息（横幅 / 表头 / 切换提示 / 汇总）在 stdout 被重定向或接管道时改走 stderr，
+  所以下面这些拿到的都是「干净的数据流」：
+    dmsqlq watch -a manager.exe | grep --line-buffered "insert into"
+        ★ grep 的输出不是终端时会块缓冲，加 --line-buffered 才实时（不加要攒够 4KB 才吐一次）
+    dmsqlq watch -a manager.exe > run.log      :: 文件里只有记录，没有横幅/表头/汇总
+    dmsqlq watch -a manager.exe | head -3      :: 下游一关，工具在「下一次写出」时自己退出
+        （Linux/macOS 会被 SIGPIPE 直接结束；Windows 没有 SIGPIPE，只能在写出时发现 ——
+          所以下游关闭后若长时间没有新记录，它会继续跟随，按 Ctrl-C 即可）
+  内置过滤仍是首选 —— 它懂语义：按客户端 / 语句类型 / 执行耗时 / SQL 子串，且能区分「SQL 文本」
+  与列里的值；管道适合临时组合（多条 and/or、cut/awk、喂给别的工具）。
+  例：-l 只匹配 SQL 文本，而 (| grep SYS) 会把「SYSDBA」这种列值也一起命中。
+
+输出格式（默认：批次 + 紧凑表格）
+  一次界面点击常带出十几条 SQL，它们的会话/客户端/用户/IP 完全相同 —— 逐条重复列出既占宽，
+  也看不出「这些是同一次操作」。所以默认把「同一会话 + 间隔不超过 -g」的记录聚成一批：
+
+    ── 批次 3 · 15:08:32.427 ──────────────────────────────────────────
+      会话: 00000000348B71C8   客户端: DIsql.exe        ← 本批共用的字段（键: 值）
+      用户: SYSDBA   线程号: 120096   IP: 127.0.0.1
+      时间         类型 耗时      行数   事务号            ← 行内只留逐条变化的字段
+      15:08:32.427 SEL       4 ms      1   4419259
+        select user;
+      15:08:32.489 SEL      54 ms   5781   4419260
+        select sql_addr, sql_id, n_exec, cmd_type from v$sqltext;
+      共 4 条 · 累计 59 ms · 跨度 62 ms                     ← 该批收尾（下批开始/静默超时/退出时打）
+
+  · SQL 单独成行、缩进 4 空格 —— 想复制 SQL 就选这一行，不会带上时间与耗时。
+  · 批次收尾里：累计 = 本批各条 EXECTIME 之和；跨度 = 本批最后一条减第一条的时间戳。
+  · 批次头的线程号取自本批第一条 —— 同一条语句解析与执行可能落在不同线程，它会变。
+  ★ 只想把 SQL 复制出去执行（例如「看某个界面到底发了哪些 SQL」）→ 加 --sql-only：
+    只打 SQL 原文，没有元信息行、没有批次头，也不缩进不截断；**每条之间空一行**（一批里
+    有的语句不带分号，挨着排会数不清），批次之间空两行。
+    · 空行对执行无害：《DM8_DIsql 使用手册》里 SQL 以 ; 结束、语句块以 / 结束，
+      而脚本执行**默认忽略 SQL 之间的空行**（SET CTRL_INFO 的 8 位才是「不忽略」）。
+    · ⚠️ 但不带分号的语句粘进 disql **不会执行** —— 日志记的是客户端发来的原文，
+      工具不替它补分号（末尾带 -- 注释时补 ; 会落进注释里），要跑请自己补。
+    反过来，元信息行里的「耗时」是判断哪条慢的唯一线索 —— 所以默认保留，别为了好看丢掉它。
+  · 时间    记录时刻（HH:MM:SS.mmm，服务端时钟）
+  ★ 不加 -a 看全库时，多个会话交叉活动会让批次切得很碎（每切一次就是 3 行批头/批尾）：
+    这时建议 -a 只看一个客户端，或用 -g 0 走扁平模式。
+  · 耗时    EXECTIME；★包含等锁时间（一条等锁 25 秒的单行 INSERT 会显示 25 s，不是 1 ms）
+  · 事务号  trxid；0 = 该语句当时没有活动事务（自动提交，或事务尚未开始）
+  · 会话    sess 会话地址；拿它可以在库上关联到这条语句（见下）
+
+  重定向 / 接管道时自动切成「扁平模式」（不加批次头与收尾）：
+    第 1 行 = 元信息，对齐成表：时间 · 类型 · 耗时 · 行数 · 线程号 · 用户 · 事务号 · 应用名 · 会话 · IP
+    第 2 行 = SQL 原文，缩进 2 空格、独占一行
+    ★ 同一秒内执行的多条记录之间会空一行（时间戳一模一样，不空行会糊成一片）。
+    终端不够宽会自动省略次要列（会话 → IP → 线程号 → 用户 → 事务号），用 -w 加宽即可全部显示。
+   想让它带批次，显式给 -g 即可（例如 -g 1000）。
+
+  未显示的两个字段（本次特意排除）：
+    · 句柄号 stmt —— 实测没有可查的视图：V$OPEN_STMT 只给每会话的 STMT_ID（不是地址），
+      唯一的地址列 STMT_DBG 只在调试会话时非空。
+    · 执行节点 EP[n] —— 单机恒为 0，无信息量。
+  拿着「会话」地址去库里查这条语句的实时状态：
+    SELECT SESS_ADDR, SESSION#, STMT_ID, TYPE, SQL_STR FROM V$OPEN_STMT WHERE SESS_ADDR = '0x<会话>';
+    再按 SESSION# 连 V$SESSIONS 看 SQL_TEXT / USER_NAME / TRX_ID / CLNT_IP / APPNAME / STATE。
+
+为什么可能「一条都不打出来」
+  ① SQLLOG.INI 的 MIN_EXEC_TIME 大于 0 —— 低于该值的语句不写「执行完成行」。
+     本工具默认只显示已执行的语句，此时会看起来什么都没发生（用 --all 可看到 [ORA] 行）。
+  ② dm.ini 的 SVR_LOG 没开（0=关，1=开）。
+  ③ 异步刷盘有延迟：ASYNC_FLUSH=1 是异步刷盘，调试时建议临时设 0（= 实时刷盘）。
+
+停止：Ctrl-C（退出时会打印本次观察的汇总）。
+`)
+	}
+}
+
+// envWidth 终端宽度：优先 $COLUMNS，否则用缺省值。
+// 不做 ioctl —— 单文件要同时编 Windows/Linux，取终端尺寸得引平台特定代码，不值得。
+func envWidth() int {
+	if v := strings.TrimSpace(os.Getenv("COLUMNS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 60 {
+			return n
+		}
+	}
+	return watchWidthDefault
+}
+
+// watchRegroup 把「选项」与「位置参数（目录/文件）」分开。
+// 必须自己做：Go 的 flag 包碰到第一个非选项参数就停止解析，
+// 而本工具习惯写成 `dmsqlq watch <目录> -a xxx`（路径在前、选项在后），
+// 不重排的话 -a xxx 会被整段当成位置参数。
+// 判据是「这个选项收不收值」—— 收值的要连它的值一起搬走，漏一个就会把值吞掉。
+func watchRegroup(args []string) (flagArgs, posArgs []string) {
+	valNames := map[string]bool{
+		"app": true, "a": true, "op": true, "k": true,
+		"min-ms": true, "m": true, "like": true, "l": true,
+		"tail": true, "T": true, "limit": true, "n": true,
+		"interval": true, "i": true, "poll": true, "width": true, "w": true,
+		"dir": true, "d": true, "pass": true, "p": true,
+		"host": true, "H": true, "port": true, "P": true,
+		// ★ 每加一个「收值」的选项都必须补进来 —— 漏了它就会把后面那个选项名当成自己的值
+		//   （实测：漏了 gap，`-g 1000 -T 3000` 报 invalid value "-T" for flag -g）。
+		//   V2.21 又踩一次同类：漏了 host，`-H 127.0.0.1` 里的 127.0.0.1 被当成位置参数
+		//   （于是它变成了「日志目录」，反而报路径错误 —— 症状和参数名错完全不同，更难认）。
+		"gap": true, "g": true,
+	}
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			posArgs = append(posArgs, args[i+1:]...)
+			break
+		}
+		if len(a) > 1 && a[0] == '-' {
+			flagArgs = append(flagArgs, a)
+			name := strings.TrimLeft(a, "-")
+			if strings.Contains(name, "=") || !valNames[name] {
+				i++ // 布尔型，或已用 = 带值
+				continue
+			}
+			if i+1 < len(args) {
+				flagArgs = append(flagArgs, args[i+1])
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+		posArgs = append(posArgs, a)
+		i++
+	}
+	return flagArgs, posArgs
+}
+
+func parseWatchArgs(args []string) (*watchOpts, string, error) {
+	o := &watchOpts{poll: watchPollDefault}
+	fs := flag.NewFlagSet("dmsqlq watch", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {} // 自定义帮助自己打，不让 flag 包抢先
+
+	var app, opList, like string
+	var minMS float64
+	var all, full, color, noHead, sqlOnly bool
+	var limit, tail, width, pollMS int
+	var dirArg, pass, host, portFlag string
+	var syncLog, showPaths, forget bool
+	var gapMS int
+
+	fs.StringVar(&app, "app", "", "")
+	fs.StringVar(&app, "a", "", "")
+	fs.StringVar(&opList, "op", "", "")
+	fs.StringVar(&opList, "k", "", "")
+	fs.Float64Var(&minMS, "min-ms", 0, "")
+	fs.Float64Var(&minMS, "m", 0, "")
+	fs.StringVar(&like, "like", "", "")
+	fs.StringVar(&like, "l", "", "")
+	fs.BoolVar(&all, "all", false, "")
+	fs.BoolVar(&all, "A", false, "")
+	fs.IntVar(&tail, "tail", 0, "")
+	fs.IntVar(&tail, "T", 0, "")
+	fs.IntVar(&limit, "limit", 0, "")
+	fs.IntVar(&limit, "n", 0, "")
+	fs.IntVar(&pollMS, "interval", int(watchPollDefault/time.Millisecond), "")
+	fs.IntVar(&pollMS, "i", int(watchPollDefault/time.Millisecond), "")
+	fs.IntVar(&pollMS, "poll", int(watchPollDefault/time.Millisecond), "")
+	fs.IntVar(&gapMS, "gap", watchGapDefaultMS, "")
+	fs.IntVar(&gapMS, "g", watchGapDefaultMS, "")
+	fs.StringVar(&dirArg, "dir", "", "")
+	fs.StringVar(&dirArg, "d", "", "")
+	fs.StringVar(&pass, "pass", "", "")
+	fs.StringVar(&pass, "p", "", "")
+	fs.StringVar(&host, "host", "", "")
+	fs.StringVar(&host, "H", "", "")
+	fs.StringVar(&portFlag, "port", "", "")
+	fs.StringVar(&portFlag, "P", "", "")
+	fs.BoolVar(&syncLog, "sync-log", false, "")
+	fs.BoolVar(&syncLog, "Y", false, "")
+	fs.BoolVar(&showPaths, "show-paths", false, "")
+	fs.BoolVar(&forget, "forget", false, "")
+	fs.IntVar(&width, "width", 0, "")
+	fs.IntVar(&width, "w", 0, "")
+	fs.BoolVar(&full, "full", false, "")
+	fs.BoolVar(&full, "F", false, "")
+	fs.BoolVar(&color, "color", false, "")
+	fs.BoolVar(&noHead, "no-header", false, "")
+	fs.BoolVar(&sqlOnly, "sql-only", false, "")
+
+	flagArgs, posArgs := watchRegroup(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		return nil, "", err
+	}
+	rest := posArgs
+	if len(rest) > 1 {
+		return nil, "", fmt.Errorf("最多给一个目录或文件，收到 %d 个：%v", len(rest), rest)
+	}
+
+	o.app = strings.TrimSpace(app)
+	o.minMS = minMS
+	o.like = strings.TrimSpace(like)
+	o.all = all
+	o.tail = tail
+	if o.tail < 0 {
+		o.tail = 0
+	}
+	o.limit = limit
+	o.full = full
+	o.color = color
+	o.noHead = noHead
+	o.dirArg = strings.TrimSpace(dirArg)
+	o.pass = strings.TrimSpace(pass)
+	o.host = strings.TrimSpace(host)
+	o.port = strings.TrimSpace(portFlag)
+	o.syncLog = syncLog
+	o.showPaths = showPaths
+	o.forget = forget
+	o.sqlOnly = sqlOnly
+
+	// 批次聚合：终端下默认开（一次点击的一批 SQL 聚在一起）；重定向/接管道时默认扁平输出，
+	// 保证「数据流」是规整的行、方便 grep/awk。用户显式给了 -g 就照办。
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "gap" || f.Name == "g" {
+			o.gapSet = true
+		}
+	})
+	if gapMS < 0 {
+		gapMS = 0
+	}
+	o.gap = time.Duration(gapMS) * time.Millisecond
+	// --sql-only 也要走批次状态机（只为「批次之间空一行」这层分组信息），
+	// 但批次头/行内列表头/收尾行都不打 —— 整份输出可以整段复制，不用删任何东西。
+	o.group = o.gap > 0 && (o.sqlOnly || isTerminal(os.Stdout) || o.gapSet)
+	if pollMS < 20 {
+		pollMS = 20
+	}
+	o.poll = time.Duration(pollMS) * time.Millisecond
+	o.width = width
+	if o.width <= 0 {
+		o.width = envWidth()
+	}
+	if o.width < 60 {
+		o.width = 60
+	}
+	if opList != "" {
+		o.ops = map[string]bool{}
+		for _, p := range strings.Split(opList, ",") {
+			p = strings.ToUpper(strings.TrimSpace(p))
+			if p != "" {
+				o.ops[p] = true
+			}
+		}
+	}
+	path := ""
+	if len(rest) == 1 {
+		path = rest[0]
+	}
+	return o, path, nil
+}
+
+// ------------------------------------------------------------ 跟随文件（含轮转）
+
+var reWatchLogName = regexp.MustCompile(`_(\d{8})_(\d{6})\.log$`)
+
+// newestLog 找目录里最新的 dmsql_*.log。
+// 优先按文件名内嵌的时间戳比（DM 命名 dmsql_<实例>_<YYYYMMDD>_<HHMMSS>.log），
+// 拿不到时间戳时退回按 mtime 比。
+func newestLog(dir string) string {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	best, bestKey := "", "\x00"
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasPrefix(n, "dmsql_") || !strings.HasSuffix(n, ".log") {
+			continue
+		}
+		m := reWatchLogName.FindStringSubmatch(n)
+		if m == nil {
+			continue
+		}
+		if key := m[1] + m[2]; key > bestKey {
+			bestKey, best = key, filepath.Join(dir, n)
+		}
+	}
+	if best != "" {
+		return best
+	}
+	var bestT time.Time
+	for _, e := range ents {
+		n := e.Name()
+		if e.IsDir() || !strings.HasPrefix(n, "dmsql_") || !strings.HasSuffix(n, ".log") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestT) {
+			best, bestT = filepath.Join(dir, n), fi.ModTime()
+		}
+	}
+	return best
+}
+
+func watchFileSize(path string) int64 {
+	if st, err := os.Stat(path); err == nil && !st.IsDir() {
+		return st.Size()
+	}
+	return 0
+}
+
+// follower 尾部增量读 + 轮转切换。
+//
+//	committed：已「消费」到的字节位置（只算完整行，末尾不完整的半行不计）
+//	pending  ：末尾那半行，等下次读到换行再拼起来
+type follower struct {
+	dir       string
+	cur       string
+	committed int64
+	pending   []byte
+}
+
+func (f *follower) readNew() []string {
+	if f.cur == "" {
+		return nil
+	}
+	fh, err := os.Open(f.cur)
+	if err != nil {
+		return nil
+	}
+	defer fh.Close()
+	fi, err := fh.Stat()
+	if err != nil {
+		return nil
+	}
+	size := fi.Size()
+	if size < f.committed { // 同文件被截断/重建
+		f.committed, f.pending = 0, nil
+	}
+	if size <= f.committed {
+		return nil
+	}
+	start := f.committed
+	buf := make([]byte, size-start)
+	n, _ := fh.ReadAt(buf, start)
+	if n <= 0 {
+		return nil
+	}
+	buf = buf[:n]
+	data := append(append([]byte(nil), f.pending...), buf...)
+	f.pending = nil
+
+	i := bytes.LastIndexByte(data, '\n')
+	if i < 0 { // 还没凑出一条完整行
+		f.pending = data
+		f.committed = start + int64(n)
+		return nil
+	}
+	f.pending = append([]byte(nil), data[i+1:]...)
+	f.committed = start + int64(n) - int64(len(f.pending))
+	return strings.Split(string(data[:i]), "\n")
+}
+
+// poll 每次轮询都重扫目录：出现更新的日志就先把旧文件读干净再切过去。
+func (f *follower) poll() (lines []string, switched bool, newName string) {
+	n := newestLog(f.dir)
+	if n != "" && n != f.cur {
+		var old []string
+		if f.cur != "" {
+			old = f.readNew()
+		}
+		f.cur, f.committed, f.pending = n, 0, nil
+		return old, true, n
+	}
+	if f.cur == "" {
+		return nil, false, ""
+	}
+	return f.readNew(), false, ""
+}
+
+// tailLines 只读文件末尾 N 行（从尾部按窗口往前扩，最多回退 32MB）
+func tailLines(path string, n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer fh.Close()
+	fi, err := fh.Stat()
+	if err != nil {
+		return nil
+	}
+	size := fi.Size()
+	if size == 0 {
+		return nil
+	}
+	window := int64(256 << 10)
+	var data []byte
+	var start int64
+	for {
+		if window > size {
+			window = size
+		}
+		start = size - window
+		buf := make([]byte, window)
+		if _, err := fh.ReadAt(buf, start); err != nil && err != io.EOF {
+			return nil
+		}
+		data = buf
+		if start == 0 || bytes.Count(data, []byte("\n")) >= n+1 || window >= 32<<20 {
+			break
+		}
+		window *= 4
+	}
+	lines := strings.Split(string(data), "\n")
+	if start > 0 && len(lines) > 0 {
+		lines = lines[1:] // 首行是半截的
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines
+}
+
+// ------------------------------------------------------------ 行解析
+
+type watchRow struct {
+	Clock   string
+	App     string // 客户端程序名（appname:）
+	User    string // 登录用户名（user:）
+	IP      string // 客户端 IP（ip:）
+	Thrd    string // 服务端线程号（thrd:）
+	Trx     string // 事务号（trxid:），0 = 当时无活动事务
+	Sess    string // 会话地址（sess:）—— 可在库上按 V$OPEN_STMT.SESS_ADDR 关联
+	Stmt    string // 语句句柄地址（stmt:）—— 无视图可查，暂不展示
+	EP      string // 执行节点（EP[n:]），单机恒 0，暂不展示
+	Op      string
+	MS      float64
+	HasMS   bool
+	Rows    int64
+	HasRows bool
+	SQL     string
+	IsStmt  bool
+}
+
+func watchHdrField(hdr, key string) string {
+	i := strings.Index(hdr, key)
+	if i < 0 {
+		return ""
+	}
+	s := hdr[i+len(key):]
+	if j := strings.IndexByte(s, ' '); j >= 0 {
+		s = s[:j]
+	}
+	return strings.TrimSpace(s)
+}
+
+// watchEP 取 EP[n] 里的执行节点号（单机恒 0）。
+func watchEP(hdr string) string {
+	i := strings.Index(hdr, "EP[")
+	if i < 0 {
+		return ""
+	}
+	j := strings.IndexByte(hdr[i:], ']')
+	if j < 0 {
+		return ""
+	}
+	return hdr[i+3 : i+j]
+}
+
+// tagIsStmt 判断方括号标签是不是「一条语句」。
+// 已知：SEL/INS/UPD/DEL/DML/DDL/CAL/ORA/ERR(-NNNN)；LGN（登录）与 DLCK 是事件。
+func tagIsStmt(tag string) bool {
+	if strings.HasPrefix(tag, "ERR(") {
+		return true
+	}
+	if tag == "LGN" || tag == "DLCK" {
+		return false
+	}
+	if len(tag) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if tag[i] < 'A' || tag[i] > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func watchEventOp(body string) string {
+	switch {
+	case strings.HasPrefix(body, "trx["):
+		return "pseg"
+	case strings.HasPrefix(body, "DLCK"):
+		return "DLCK"
+	}
+	if i := strings.IndexAny(body, " :"); i > 0 {
+		return body[:i]
+	}
+	if len(body) > 7 {
+		return body[:7]
+	}
+	return body
+}
+
+// watchSplitTail 把「SQL + EXECTIME: N(ms) + ROWCOUNT: N(rows) + EXEC_ID: N」拆开
+func watchSplitTail(s string) (sql string, ms float64, hasMS bool, rows int64, hasRows bool) {
+	cut := -1
+	for _, m := range []string{" EXECTIME:", " ROWCOUNT:", " EXEC_ID:"} {
+		if i := strings.Index(s, m); i >= 0 && (cut < 0 || i < cut) {
+			cut = i
+		}
+	}
+	if cut < 0 {
+		return strings.TrimRight(s, " \t"), 0, false, 0, false
+	}
+	sql = strings.TrimRight(s[:cut], " \t")
+	tail := s[cut:]
+	if i := strings.Index(tail, "EXECTIME:"); i >= 0 {
+		ms, hasMS = watchParseDur(tail[i+len("EXECTIME:"):])
+	}
+	if i := strings.Index(tail, "ROWCOUNT:"); i >= 0 {
+		rows, hasRows = watchParseInt(tail[i+len("ROWCOUNT:"):])
+	}
+	return
+}
+
+func watchParseDur(s string) (float64, bool) {
+	s = strings.TrimLeft(s, " \t")
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, false
+	}
+	u := strings.ToLower(s[i:])
+	switch {
+	case strings.HasPrefix(u, "(us"):
+		v /= 1000
+	case strings.HasPrefix(u, "(ns"):
+		v /= 1e6
+	}
+	return v, true
+}
+
+func watchParseInt(s string) (int64, bool) {
+	s = strings.TrimLeft(s, " \t")
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(s[:i], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// cleanWatchSQL 去掉客户端打的 /***Xxx***/ 标记（客户端列已经说明身份，这里重复）
+func cleanWatchSQL(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "/***") {
+		if i := strings.Index(s, "***/"); i >= 0 {
+			s = strings.TrimSpace(s[i+4:])
+		}
+	}
+	return s
+}
+
+func parseWatchLine(line string) (watchRow, bool) {
+	var r watchRow
+	if len(line) < 24 || line[4] != '-' || line[7] != '-' || line[10] != ' ' || line[13] != ':' {
+		return r, false
+	}
+	r.Clock = line[11:23]
+	close := strings.Index(line, ") ")
+	if close < 24 {
+		return r, false
+	}
+	hdr := line[:close]
+	body := strings.TrimLeft(line[close+2:], " ")
+	r.App = watchHdrField(hdr, "appname:")
+	r.User = watchHdrField(hdr, "user:")
+	r.IP = watchHdrField(hdr, "ip:")
+	r.Thrd = watchHdrField(hdr, "thrd:")
+	r.Trx = watchHdrField(hdr, "trxid:")
+	r.Sess = watchHdrField(hdr, "sess:")
+	r.Stmt = watchHdrField(hdr, "stmt:")
+	r.EP = watchEP(hdr)
+
+	if strings.HasPrefix(body, "[") {
+		i := strings.IndexByte(body, ']')
+		if i < 0 {
+			return r, false
+		}
+		tag := body[1:i]
+		rest := strings.TrimLeft(strings.TrimPrefix(body[i+1:], ":"), " ")
+		r.IsStmt = tagIsStmt(tag)
+		if strings.HasPrefix(tag, "ERR(") {
+			r.Op = "ERR"
+		} else {
+			r.Op = tag
+		}
+		r.SQL, r.MS, r.HasMS, r.Rows, r.HasRows = watchSplitTail(rest)
+		r.SQL = cleanWatchSQL(r.SQL)
+		return r, true
+	}
+
+	r.Op = watchEventOp(body)
+	r.SQL = body
+	if strings.HasPrefix(body, "TRX: ") {
+		r.SQL = strings.TrimSpace(body[5:])
+	}
+	return r, true
+}
+
+// ------------------------------------------------------------ 过滤与渲染
+
+func (o *watchOpts) keep(r watchRow) bool {
+	if o.app != "" && !strings.Contains(strings.ToLower(r.App), strings.ToLower(o.app)) {
+		return false
+	}
+	if !o.all {
+		// 默认只显示「真正执行过」的语句：有 EXECTIME 的执行完成行；ERR 始终显示。
+		if !r.IsStmt || r.Op == "ORA" {
+			return false
+		}
+		if !r.HasMS && r.Op != "ERR" {
+			return false
+		}
+	}
+	if len(o.ops) > 0 && !o.ops[r.Op] {
+		return false
+	}
+	if o.minMS > 0 && (!r.HasMS || r.MS < o.minMS) {
+		return false
+	}
+	if o.like != "" && !strings.Contains(strings.ToLower(r.SQL), strings.ToLower(o.like)) {
+		return false
+	}
+	return true
+}
+
+func (o *watchOpts) filterDesc() string {
+	parts := []string{}
+	if o.all {
+		parts = append(parts, "显示全部原始行")
+	} else {
+		parts = append(parts, "只显示已执行的语句")
+	}
+	if len(o.ops) > 0 {
+		ks := make([]string, 0, len(o.ops))
+		for k := range o.ops {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+		parts = append(parts, "类型="+strings.Join(ks, "/"))
+	}
+	if o.minMS > 0 {
+		parts = append(parts, "耗时≥"+watchDur(o.minMS))
+	}
+	if o.like != "" {
+		parts = append(parts, "SQL 含「"+o.like+"」")
+	}
+	return strings.Join(parts, " · ")
+}
+
+func (o *watchOpts) paint(s, c string) string {
+	if !o.color || c == "" {
+		return s
+	}
+	return c + s + clrReset
+}
+
+func watchOpColor(op string) string {
+	switch op {
+	case "ERR":
+		return clrRed
+	case "SEL":
+		return clrCyan
+	case "INS", "UPD", "DEL", "DML", "DDL":
+		return clrYellow
+	case "CAL":
+		return clrGreen
+	case "ORA":
+		return clrDim
+	}
+	return clrDim
+}
+
+func watchDur(ms float64) string {
+	switch {
+	case ms <= 0:
+		return "<1 ms" // EXECTIME: 0(ms) 只说明不到 1 毫秒，别写成 0.0 us 那种假精度
+	case ms < 1:
+		return strconv.FormatFloat(ms*1000, 'f', 1, 64) + " us"
+	case ms < 1000:
+		return strconv.FormatFloat(ms, 'f', 0, 64) + " ms"
+	case ms < 60000:
+		return strconv.FormatFloat(ms/1000, 'f', 2, 64) + " s"
+	default:
+		return strconv.FormatFloat(ms/60000, 'f', 1, 64) + " m"
+	}
+}
+
+// 元信息行的列。宽度不够时按 drop 值从小到大丢列（0 = 永不丢）。
+type watchCol struct {
+	key   string
+	title string
+	w     int
+	right bool // 数值列右对齐
+	drop  int  // 丢弃顺序：越小越先丢
+}
+
+func watchCols(showApp bool) []watchCol {
+	cols := []watchCol{
+		{key: "time", title: "时间", w: 12},
+		{key: "op", title: "类型", w: 4},
+		{key: "dur", title: "耗时", w: 9, right: true},
+		{key: "rows", title: "行数", w: 6, right: true},
+		{key: "thrd", title: "线程号", w: 7, right: true, drop: 3},
+		{key: "user", title: "用户", w: 12, drop: 4},
+		{key: "trx", title: "事务号", w: 13, right: true, drop: 5},
+	}
+	// 应用名总是显示：它是「谁在跑这条 SQL」的第一手信息。
+	// 已经用 -a 过滤时这列是常量，所以宽度不够时优先丢它（drop=6）。
+	appDrop := 0
+	if !showApp {
+		appDrop = 6
+	}
+	cols = append(cols, watchCol{key: "app", title: "应用名", w: 16, drop: appDrop})
+	cols = append(cols,
+		watchCol{key: "sess", title: "会话", w: 16, drop: 1},
+		watchCol{key: "ip", title: "IP", w: 15, drop: 2},
+	)
+	return cols
+}
+
+// watchFit 按输出宽度裁列；返回可用列与被省略的列名（用 / 连接）。
+func watchFit(o *watchOpts, showApp bool) ([]watchCol, string) {
+	cols := watchCols(showApp)
+	need := func(cs []watchCol) int {
+		n := 0
+		for _, c := range cs {
+			n += c.w + 1
+		}
+		return n
+	}
+	var dropped []string
+	for need(cols) > o.width {
+		idx, best := -1, 1<<30
+		for i, c := range cols {
+			if c.drop > 0 && c.drop < best {
+				idx, best = i, c.drop
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		dropped = append(dropped, cols[idx].title)
+		cols = append(cols[:idx:idx], cols[idx+1:]...)
+	}
+	return cols, strings.Join(dropped, "/")
+}
+
+func watchHeader(cols []watchCol) (head, sep string) {
+	var h, s strings.Builder
+	for _, c := range cols {
+		t := c.title
+		if c.right {
+			t = lpad(t, c.w) // 数值列右对齐，标题跟着右对齐，免得标题与数字离得老远
+		} else {
+			t = pad(t, c.w)
+		}
+		h.WriteString(t + " ")
+		s.WriteString(strings.Repeat("─", c.w) + " ")
+	}
+	return strings.TrimRight(h.String(), " "), strings.TrimRight(s.String(), " ")
+}
+
+// colText 取某列在一条记录上的显示值。空值统一显示成 "-"。
+func (o *watchOpts) colText(r watchRow, key string) string {
+	switch key {
+	case "time":
+		return r.Clock
+	case "op":
+		if r.Op == "" {
+			return "?"
+		}
+		return r.Op
+	case "dur":
+		if !r.HasMS {
+			return "-"
+		}
+		return watchDur(r.MS)
+	case "rows":
+		if !r.HasRows {
+			return "-"
+		}
+		return strconv.FormatInt(r.Rows, 10)
+	case "thrd":
+		return dash(r.Thrd)
+	case "user":
+		return dash(r.User)
+	case "trx":
+		return dash(r.Trx)
+	case "app":
+		return dash(r.App)
+	case "sess":
+		return dash(r.Sess)
+	case "ip":
+		return dash(r.IP)
+	}
+	return ""
+}
+
+// renderRows 一条记录渲染成两行（扁平模式，SQL 缩进 2 空格）。见 renderRowsAt。
+func (o *watchOpts) renderRows(r watchRow, cols []watchCol) []string {
+	return o.renderRowsAt(r, cols, 2)
+}
+
+// renderRowsAt 一条记录渲染成两行：
+//
+//	① 元信息行（按 cols 对齐，方便横向扫读）
+//	② SQL 原文行（独占一行，缩进 indent 个空格）—— 想复制 SQL 只选这一行即可，
+//	   不会再连带时间与耗时（V2.15 之前是同一行，复制时被连坐）。
+//
+// 批次模式用 indent=4：批内比「会话: …」这类键值行再深一层，视觉上归到该条记录之下。
+func (o *watchOpts) renderRowsAt(r watchRow, cols []watchCol, indent int) []string {
+	if o.sqlOnly {
+		// 这份输出的唯一用途就是「复制去执行」，所以：不缩进、不截断、不带任何元信息。
+		sql := r.SQL
+		if sql == "" {
+			sql = r.Op
+		}
+		return []string{sql}
+	}
+	var b strings.Builder
+	for i, c := range cols {
+		v := clip(o.colText(r, c.key), c.w)
+		if c.right {
+			v = lpad(v, c.w)
+		} else {
+			v = pad(v, c.w)
+		}
+		if c.key == "op" {
+			v = o.paint(v, watchOpColor(r.Op))
+		}
+		b.WriteString(v)
+		if i != len(cols)-1 {
+			b.WriteString(" ")
+		}
+	}
+	sql := r.SQL
+	if sql == "" {
+		sql = r.Op
+	}
+	if !o.full {
+		sql = clip(sql, o.width-indent)
+	}
+	return []string{strings.TrimRight(b.String(), " "), strings.Repeat(" ", indent) + sql}
+}
+
+// ══════════════════════════════════════════════ 批次聚合（V2.18）
+//
+// 为什么要聚合：一次界面点击（或一次 disql 执行）常带出十几条 SQL —— 它们的
+// 会话/客户端/用户/IP 完全相同，逐条重复列出来既占宽度，也看不出「这些是同一次操作」。
+//
+// 判据：**同一会话 + 与上一条的间隔不超过 -g**（默认 1000ms）。
+// 批次头用「键: 值」列出本批共用的字段，行内只留逐条变化的字段（时间/类型/耗时/行数/事务号）；
+// 批次收尾（共 N 条 · 累计 · 跨度）在下批开始、静默超时或退出时打印。
+
+// watchClockMS 把 "HH:MM:SS.mmm" 转成当天毫秒（-1 = 解析失败）。
+func watchClockMS(c string) int64 {
+	if len(c) < 8 {
+		return -1
+	}
+	dig := func(a, b int) (int64, bool) {
+		v := int64(0)
+		for i := a; i < b; i++ {
+			if c[i] < '0' || c[i] > '9' {
+				return 0, false
+			}
+			v = v*10 + int64(c[i]-'0')
+		}
+		return v, true
+	}
+	hh, ok1 := dig(0, 2)
+	mm, ok2 := dig(3, 5)
+	ss, ok3 := dig(6, 8)
+	if !ok1 || !ok2 || !ok3 {
+		return -1
+	}
+	ms := int64(0)
+	if len(c) >= 12 && c[8] == '.' {
+		if v, ok := dig(9, 12); ok {
+			ms = v
+		}
+	}
+	return ((hh*60+mm)*60+ss)*1000 + ms
+}
+
+// watchGroupCols 批次模式的行内列：批次共用的字段已上提到批次头，这里只留逐条会变的。
+// 合计 44 列（含间隔），任何终端都放得下，不需要丢列。
+func watchGroupCols() []watchCol {
+	return []watchCol{
+		{key: "time", title: "时间", w: 12},
+		{key: "op", title: "类型", w: 4},
+		{key: "dur", title: "耗时", w: 9, right: true},
+		{key: "rows", title: "行数", w: 6, right: true},
+		{key: "trx", title: "事务号", w: 13, right: true, drop: 1},
+	}
+}
+
+// watchGroup 一批记录的聚合状态。
+type watchGroup struct {
+	open     bool
+	idx      int // 批次序号，从 1 开始
+	key      string
+	startMS  int64 // 批内第一条的「当天毫秒」
+	lastMS   int64
+	n        int
+	sumMS    float64
+	hasMS    bool
+	lastWall time.Time // 最后一条记录到达的墙钟时刻（用于静默收尾）
+}
+
+// groupKey 判「是不是同一批」的键：优先会话；没有会话（--all 的事件行）时退到 客户端|IP。
+func (o *watchOpts) groupKey(r watchRow) string {
+	if r.Sess != "" {
+		return r.Sess
+	}
+	if r.App != "" || r.IP != "" {
+		return r.App + "|" + r.IP
+	}
+	return "-"
+}
+
+// belong 判断该记录是否还落在当前批次里；false 表示调用方应先 close 再 open1。
+func (g *watchGroup) belong(o *watchOpts, key string, m int64) bool {
+	if !g.open || key != g.key {
+		return false
+	}
+	if m < 0 || g.lastMS < 0 {
+		return true // 时间戳拿不到就不断批（宁可并在一起，也不要无意义地切开）
+	}
+	return m-g.lastMS <= int64(o.gap/time.Millisecond)
+}
+
+// open1 开一批：批次标题 + 本批共用的键值行 + 行内列表头。
+func (g *watchGroup) open1(o *watchOpts, w io.Writer, r watchRow, rowHead string) {
+	first := g.idx == 0
+	g.open = true
+	g.idx++
+	g.key = o.groupKey(r)
+	g.n, g.sumMS, g.hasMS = 0, 0, false
+	g.startMS = watchClockMS(r.Clock)
+	g.lastMS = g.startMS
+	g.lastWall = time.Now()
+
+	if o.sqlOnly {
+		// 只出 SQL：批次头/键值行/行内列表头一律不打；空行分隔统一由 emit 处理
+		// （这样「每条之间一行、每批之间两行」只有一个口径）。
+		return
+	}
+	if !first {
+		fmt.Fprintln(w) // 批次之间空一行，与批内的紧凑排布区分开
+	}
+	title := "── 批次 " + strconv.Itoa(g.idx) + " · " + r.Clock + " "
+	rule := o.width
+	if rule > 100 {
+		rule = 100 // 150 列的终端下拉满太夸张，100 列足够当视觉边界
+	}
+	fill := rule - dispWidth(title)
+	if fill < 4 {
+		fill = 4
+	}
+	fmt.Fprintln(w, o.paint(title+strings.Repeat("─", fill), clrDim))
+	fmt.Fprintf(w, "  会话: %s   客户端: %s\n", dash(r.Sess), dash(r.App))
+	fmt.Fprintf(w, "  用户: %s   线程号: %s   IP: %s\n", dash(r.User), dash(r.Thrd), dash(r.IP))
+	fmt.Fprintln(w, rowHead)
+}
+
+// close 收尾当前批次（下批开始 / 静默超时 / 退出时都会调；重复调用安全）。
+func (g *watchGroup) close(o *watchOpts, w io.Writer) {
+	if !g.open {
+		return
+	}
+	if o.sqlOnly {
+		g.open = false // 只出 SQL：不打收尾行
+		return
+	}
+	span := g.lastMS - g.startMS
+	if span < 0 {
+		span = 0
+	}
+	sumTxt := "-"
+	if g.hasMS {
+		sumTxt = watchDur(g.sumMS)
+	}
+	fmt.Fprintln(w, o.paint("  共 "+strconv.Itoa(g.n)+" 条 · 累计 "+sumTxt+
+		" · 跨度 "+watchDur(float64(span)), clrDim))
+	g.open = false
+}
+
+// ------------------------------------------------------------ 汇总
+
+type watchStat struct {
+	start   time.Time
+	n       int
+	nGroup  int // 批次数量（批次模式）
+	byOp    map[string]int
+	slowest []watchRow
+}
+
+func (st *watchStat) note(r watchRow) {
+	if !r.HasMS {
+		return
+	}
+	if len(st.slowest) < watchSlowestKeep {
+		st.slowest = append(st.slowest, r)
+	} else if r.MS <= st.slowest[len(st.slowest)-1].MS {
+		return
+	} else {
+		st.slowest[len(st.slowest)-1] = r
+	}
+	sort.SliceStable(st.slowest, func(i, j int) bool { return st.slowest[i].MS > st.slowest[j].MS })
+}
+
+func watchSummary(w io.Writer, st *watchStat) {
+	fmt.Fprintln(w)
+	sec(w, "本次观察汇总")
+	fmt.Fprintf(w, "  %s %s\n", pad("观察时长:", 11), time.Since(st.start).Round(time.Second))
+	fmt.Fprintf(w, "  %s %d\n", pad("输出条数:", 11), st.n)
+	if st.nGroup > 0 {
+		fmt.Fprintf(w, "  %s %d\n", pad("批次数量:", 11), st.nGroup)
+	}
+	if len(st.byOp) > 0 {
+		keys := make([]string, 0, len(st.byOp))
+		for k := range st.byOp {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if st.byOp[keys[i]] != st.byOp[keys[j]] {
+				return st.byOp[keys[i]] > st.byOp[keys[j]]
+			}
+			return keys[i] < keys[j]
+		})
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s %d", k, st.byOp[k]))
+		}
+		fmt.Fprintf(w, "  %s %s\n", pad("按类型:", 11), strings.Join(parts, " · "))
+	}
+	if len(st.slowest) > 0 {
+		fmt.Fprintf(w, "  %s\n", fmt.Sprintf("最慢 %d 条:", len(st.slowest)))
+		for _, r := range st.slowest {
+			fmt.Fprintf(w, "    %9s  %-7s  %s\n", watchDur(r.MS), r.Op, clip(r.SQL, 100))
+		}
+	}
+	fmt.Fprintln(w)
+}
+
+// ------------------------------------------------------------ 入口
+
+func watchMain(args []string) int {
+	dataW, diagW := watchStreams()
+
+	o, pathArg, err := parseWatchArgs(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			watchUsage()()
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "参数有误：%v\n\n", err)
+		watchUsage()()
+		return 2
+	}
+
+	dir, cur := "", ""
+	if pathArg != "" {
+		if st, e := os.Stat(pathArg); e == nil && st.IsDir() {
+			dir = pathArg
+		} else {
+			cur = pathArg
+			dir = filepath.Dir(pathArg)
+		}
+	}
+	if pathArg == "" && o.dirArg != "" {
+		// -d 给的是目录就当目录，是文件就当文件
+		if st, e := os.Stat(o.dirArg); e == nil && !st.IsDir() {
+			cur, dir = o.dirArg, filepath.Dir(o.dirArg)
+		} else {
+			dir = o.dirArg
+		}
+	}
+	if o.forget {
+		forgetWatchDir()
+		fmt.Fprintln(os.Stdout, "已清掉记住的日志目录（下次会重新自动定位）。")
+		return 0
+	}
+
+	loc := watchLoc{dir: dir}
+	if dir == "" {
+		loc = resolveWatchDir()
+		dir = loc.dir
+	} else {
+		loc.why = "命令行指定"
+	}
+	if o.showPaths {
+		printWatchPaths(loc)
+		return 0
+	}
+	if dir == "" {
+		fmt.Fprintln(os.Stderr, "没找到 SQL 日志目录。三种办法：")
+		fmt.Fprintln(os.Stderr, "  1) 让工具自动找：确认 DM 装在常见位置（如 D:\\dmdbms），直接跑 dmsqlq watch")
+		fmt.Fprintln(os.Stderr, "  2) 显式指定：dmsqlq watch \"D:\\dmdbms\\log\" -a manager.exe")
+		fmt.Fprintln(os.Stderr, "  3) 设环境变量：set DMSQLQ_LOG_DIR=D:\\dmdbms\\log")
+		fmt.Fprintln(os.Stderr, "（日志目录看 sqllog.ini 的 FILE_PATH；相对路径的基准是 dmserver 的工作目录，一般是 <安装目录>/bin）")
+		fmt.Fprintln(os.Stderr, "想看都扫到了哪些候选，加 --show-paths。")
+		return 2
+	}
+	if abs, e := filepath.Abs(dir); e == nil {
+		dir = abs
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		fmt.Fprintf(os.Stderr, "目录不存在：%s\n", dir)
+		return 2
+	}
+	if loc.why == "自动定位" {
+		saveWatchDir(dir)
+	}
+	if cur != "" {
+		if abs, e := filepath.Abs(cur); e == nil {
+			cur = abs
+		}
+	} else {
+		cur = newestLog(dir)
+	}
+
+	f := &follower{dir: dir}
+	var replay []string
+	if cur != "" {
+		if o.tail > 0 {
+			replay = tailLines(cur, o.tail)
+		}
+		f.cur, f.committed, f.pending = cur, watchFileSize(cur), nil
+	}
+
+	showApp := o.app == ""
+
+	// ---- 可选：连库做体检 / 临时切成同步刷盘（-Y）
+	if o.pass == "" {
+		o.pass = strings.TrimSpace(os.Getenv("DM_PASS"))
+	}
+	var db *dmProbe
+	var restore *syncRestore
+	if o.pass != "" || o.syncLog {
+		if o.pass == "" {
+			fmt.Fprintln(os.Stderr, "-Y/--sync-log 需要 SYSDBA 口令：用 -p 给，或设环境变量 DM_PASS。")
+			return 2
+		}
+		p, err := openDMProbe(loc, o.pass, o.host, o.port)
+		if err != nil {
+			if o.syncLog {
+				fmt.Fprintf(os.Stderr, "连库失败（-Y 需要它）：%v\n", err)
+				return 2
+			}
+			fmt.Fprintf(diagW, "  体检    跳过（%v）\n", err)
+		} else {
+			db = p
+		}
+	}
+	if db != nil {
+		// 先报体检（此时还是改动前的原值），再动手改 —— 顺序反过来会让人看到改完的值
+		for _, ln := range db.report() {
+			fmt.Fprintf(diagW, "  %s\n", ln)
+		}
+		if o.syncLog && !isLocalHost(db.host) {
+			// 🩸 远端库不切同步刷盘（V2.21）。
+			// 理由三条：① 同步刷盘对该库是实打实的性能开销，影响的不只是本工具；
+			// ② 还原依赖网络 —— 进程被强杀或网络中断时，库里会永久停留在 ASYNC_FLUSH=0；
+			// ③ 还原脚本落在本机临时目录，远端库出问题时现场未必找得到。
+			// 只保留「只读体检」，把改动留给在那台机器上跑的原生 dmsqlq。
+			fmt.Fprintf(diagW, "  %s\n", o.paint(
+				"  ⚠️ -Y 已跳过：目标是远端实例（"+db.host+"）—— 远端不允许自动切同步刷盘（只读体检已照常执行）。", clrYellow))
+			fmt.Fprintln(diagW, "     要切刷盘请到那台机器上用本机的 dmsqlq 执行；本工具只在 127.0.0.1 时才改动配置。")
+		} else if o.syncLog {
+			r, err := db.switchToSync()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "-Y 失败：%v\n", err)
+				db.close()
+				return 2
+			}
+			restore = r
+		}
+	}
+	if restore != nil {
+		defer func() {
+			if restore.done {
+				return
+			}
+			if err := db.restoreSync(restore); err != nil {
+				fmt.Fprintf(diagW, "\n  ⚠️ 还原 ASYNC_FLUSH 失败：%v\n", err)
+				fmt.Fprintf(diagW, "     请手工执行：%s\n", restore.script)
+			} else {
+				fmt.Fprintf(diagW, "\n  已还原 SQL 日志刷盘方式：ASYNC_FLUSH=%s ✓\n", restore.orig)
+			}
+		}()
+	}
+
+	fmt.Fprintf(diagW, "dmsqlq %s · 实时监视 SQL 日志\n", ver)
+	if cur != "" {
+		fmt.Fprintf(diagW, "  跟随:    %s\n", cur)
+	} else {
+		fmt.Fprintf(diagW, "  跟随:    %s（目录里还没有 dmsql_*.log，等它出现）\n", dir)
+	}
+	if loc.why != "" {
+		fmt.Fprintf(diagW, "  路径:    %s   ← %s\n", dir, loc.why)
+	}
+	for _, h := range loc.hints {
+		fmt.Fprintf(diagW, "  另发现:  %s\n", h)
+	}
+	if restore != nil {
+		fmt.Fprintln(diagW)
+		fmt.Fprintf(diagW, "  %s\n", o.paint("  ⚠️ 已临时把 SQL 日志改成「同步刷盘」（原值 "+restore.orig+"），退出时自动还原。", clrYellow))
+		fmt.Fprintln(diagW, "     这是改数据库自己的 sqllog.ini（会写盘）—— 生产库请确认能接受同步刷盘的性能开销。")
+		fmt.Fprintf(diagW, "     万一本进程被强杀，手工还原脚本已写到：%s\n", restore.script)
+	}
+	if showApp {
+		fmt.Fprintf(diagW, "  过滤:    %s\n", o.filterDesc())
+	} else {
+		fmt.Fprintf(diagW, "  过滤:    客户端=%s · %s\n", o.app, o.filterDesc())
+	}
+	fmt.Fprintf(diagW, "  轮询:    %s · 输出宽 %d 列\n", o.poll, o.width)
+	if o.sqlOnly {
+		if o.group {
+			fmt.Fprintf(diagW, "  批次:    同一会话 + 间隔 ≤ %s 视为同一批（批次之间空一行）\n", o.gap)
+		}
+		fmt.Fprintln(diagW, "  SQL:     只输出 SQL 原文（--sql-only）—— 无元信息行、不缩进、不截断，整段可直接复制")
+	} else if o.group {
+		fmt.Fprintf(diagW, "  批次:    同一会话 + 间隔 ≤ %s 视为同一批（改 -g 指定；0 = 不聚合）\n",
+			o.gap)
+	} else {
+		fmt.Fprintf(diagW, "  批次:    不聚合（扁平输出）—— 用 -g 1000 可开启批次\n")
+	}
+	fmt.Fprintln(diagW)
+	fmt.Fprintln(diagW, "  去点 DM 管理工具的界面，SQL 会实时打在下面。Ctrl-C 停止。")
+	if !o.noHead {
+		if o.sqlOnly {
+			fmt.Fprintln(diagW, o.paint("  列说明:  只打印 SQL 原文 —— 不缩进、不截断（要粘贴执行就不该被截断）、"+
+				"不带元信息行与批次头", clrDim))
+			fmt.Fprintln(diagW, o.paint("           每条 SQL 之间空一行；批次之间空两行（配 -g 0 则统一一行一条）", clrDim))
+			fmt.Fprintln(diagW, o.paint("           「哪条慢、什么类型、影响几行」这类判读信息在默认模式里（去掉 --sql-only）", clrDim))
+		} else if o.group {
+			fmt.Fprintln(diagW, o.paint("  列说明:  批次头 = 本批共用的字段（会话 / 客户端 / 用户 / 线程号 / IP）；行内 = 逐条变化的字段", clrDim))
+			fmt.Fprintln(diagW, o.paint("           时间: 记录时刻 · 类型: 语句类型 · 耗时: EXECTIME（★含等锁时间）· 行数: ROWCOUNT · 事务号: trxid", clrDim))
+			fmt.Fprintln(diagW, o.paint("           事务号 0 = 当时无活动事务；批次头的线程号取自本批第一条（同一语句可能换线程）", clrDim))
+			fmt.Fprintln(diagW, o.paint("           SQL 单独成行、缩进 4 空格 —— 整行可直接复制；句柄号与执行节点已省略", clrDim))
+			fmt.Fprintln(diagW, o.paint("           会话: sess 会话地址，可在库上按 V$OPEN_STMT.SESS_ADDR 关联（详见 -h）", clrDim))
+		} else {
+			fmt.Fprintln(diagW, o.paint("  列说明:  时间: 记录时刻 · 类型: 语句类型 · 耗时: EXECTIME（★含等锁时间）· 行数: ROWCOUNT", clrDim))
+			fmt.Fprintln(diagW, o.paint("           线程号 / 用户 / 事务号 / 应用名 / IP: 取自日志头部；事务号 0 = 当时无活动事务", clrDim))
+			fmt.Fprintln(diagW, o.paint("           会话: sess 会话地址，可在库上按 V$OPEN_STMT.SESS_ADDR 关联（详见 -h）", clrDim))
+			fmt.Fprintln(diagW, o.paint("           SQL 单独成行、缩进 2 空格 —— 整行可直接复制；句柄号与执行节点已省略", clrDim))
+		}
+	}
+	fmt.Fprintln(diagW)
+
+	var cols []watchCol
+	var droppedCols, head, sep, rowHead string
+	if o.group {
+		cols = watchGroupCols()
+		rowHead, _ = watchHeader(cols) // 批次模式：行内列表头在每个批次头之后重印
+	} else {
+		cols, droppedCols = watchFit(o, showApp)
+		head, sep = watchHeader(cols)
+	}
+
+	// 先把「回放」横幅打出来，再打表头 —— 否则横幅会夹在表头与记录之间。
+	var replayKept []string
+	for _, ln := range replay {
+		if rr, ok := parseWatchLine(ln); ok && o.keep(rr) {
+			replayKept = append(replayKept, ln)
+		}
+	}
+	if len(replay) > 0 {
+		if len(replayKept) > 0 {
+			fmt.Fprintln(diagW, o.paint("  ── 回放最近 "+strconv.Itoa(len(replay))+
+				" 行（匹配 "+strconv.Itoa(len(replayKept))+" 条）──", clrDim))
+		} else {
+			fmt.Fprintln(diagW, o.paint("  ── 回放最近 "+strconv.Itoa(len(replay))+
+				" 行：没有匹配上面过滤条件的记录 ──", clrDim))
+		}
+	}
+	if droppedCols != "" {
+		fmt.Fprintf(diagW, "  （输出宽 %d 列放不下，已省略：%s —— 用 -w 加宽可显示）\n", o.width, droppedCols)
+	}
+	if !o.noHead && !o.group && !o.sqlOnly {
+		fmt.Fprintln(diagW, head)
+		fmt.Fprintln(diagW, sep)
+	}
+
+	st := &watchStat{start: time.Now(), byOp: map[string]int{}}
+	lastSec := ""        // 扁平模式：上一条已输出记录的「秒」（HH:MM:SS）
+	pipeBroken := false  // 下游（grep / head…）把管道关掉后置位
+	grp := &watchGroup{} // 批次模式：当前批次的聚合状态
+
+	// 记录一律走 dataW，且每次写入都查错：Windows 没有 SIGPIPE，管道被下游关闭时 write 只返回
+	// 错误、进程不会自己死 —— 不查错的话 `dmsqlq watch … | head -3` 会留下一个永远轮询的孤儿进程。
+	writeData := func(line string) bool {
+		if _, err := fmt.Fprintln(dataW, line); err != nil {
+			pipeBroken = true
+			return false
+		}
+		return true
+	}
+
+	emit := func(lines []string) {
+		for _, ln := range lines {
+			r, ok := parseWatchLine(ln)
+			if !ok || !o.keep(r) {
+				continue
+			}
+			if o.group {
+				// 批次模式：同一会话（且间隔不超过 -g）的记录聚成一批。
+				m := watchClockMS(r.Clock)
+				nb := !grp.belong(o, o.groupKey(r), m)
+				if nb {
+					grp.close(o, dataW)
+					if pipeBroken {
+						return
+					}
+					grp.open1(o, dataW, r, rowHead)
+					if pipeBroken {
+						return
+					}
+				}
+				if o.sqlOnly {
+					// 只出 SQL：**每条之间空一行** —— 一批里有的语句不带分号（日志记的是客户端发来的
+					// 原文），一行挨一行会数不清是几条。换批再多空一行，保留「这批是同一次操作」。
+					if st.n > 0 {
+						if !writeData("") {
+							return
+						}
+						if nb {
+							if !writeData("") {
+								return
+							}
+						}
+					}
+				}
+				grp.n++
+				if r.HasMS {
+					grp.sumMS += r.MS
+					grp.hasMS = true
+				}
+				if m >= 0 {
+					grp.lastMS = m
+				}
+				grp.lastWall = time.Now()
+				for _, l := range o.renderRowsAt(r, cols, 4) {
+					if !writeData(l) {
+						return
+					}
+				}
+			} else {
+				// 扁平模式：与 V2.17 相同的形态（10 列元信息行 + SQL 独占行）。
+				// 同一秒内执行的多条语句（典型是一次界面点击带出十几条）时间戳一模一样，
+				// 挨着排会糊成一片 —— 用空行把同一秒内的记录彼此隔开。
+				sec := r.Clock
+				if len(sec) > 8 {
+					sec = sec[:8]
+				}
+				if o.sqlOnly {
+					// 只出 SQL：每条之间空一行（-g 0 没有批次概念，就统一一行一条）
+					if st.n > 0 {
+						if !writeData("") {
+							return
+						}
+					}
+				} else if lastSec != "" && sec == lastSec {
+					if !writeData("") {
+						return
+					}
+				}
+				lastSec = sec
+				for _, l := range o.renderRows(r, cols) {
+					if !writeData(l) {
+						return
+					}
+				}
+				if !o.noHead && !o.sqlOnly && st.n > 0 && st.n%watchHeaderEvery == 0 {
+					fmt.Fprintln(diagW)
+					fmt.Fprintln(diagW, head)
+					fmt.Fprintln(diagW, sep)
+				}
+			}
+			st.n++
+			st.byOp[r.Op]++
+			st.note(r)
+			if o.limit > 0 && st.n >= o.limit {
+				return
+			}
+		}
+	}
+
+	if len(replayKept) > 0 {
+		emit(replayKept)
+	}
+	// finish 统一收尾：收掉未闭合的批次 → 打印汇总 → 还原 ASYNC_FLUSH。
+	finish := func(note string) int {
+		if note != "" {
+			fmt.Fprintln(diagW, note)
+		}
+		if o.group {
+			grp.close(o, dataW)
+			st.nGroup = grp.idx
+		}
+		watchSummary(diagW, st)
+		restoreNow(db, &restore)
+		return 0
+	}
+
+	if pipeBroken {
+		return finish("  下游已关闭（管道断开），退出。")
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	ticker := time.NewTicker(o.poll)
+	defer ticker.Stop()
+	nudged := false
+	for {
+		select {
+		case <-sigCh:
+			return finish("")
+		case <-ticker.C:
+		}
+
+		lines, switched, newName := f.poll()
+		if switched && newName != "" {
+			fmt.Fprintln(diagW, o.paint("  ── 日志切换 → "+filepath.Base(newName)+" ──", clrDim))
+		}
+		emit(lines)
+
+		if pipeBroken {
+			return finish("  下游已关闭（管道断开），退出。")
+		}
+		if o.limit > 0 && st.n >= o.limit {
+			return finish("")
+		}
+		// 批次模式：静默超过一个批间隔就收掉当前批次 —— 否则最后一批的收尾行要等到
+		// 下批开始（可能几分钟后）或退出时才出现，实时看会很懵。
+		if o.group && grp.open && time.Since(grp.lastWall) >= o.gap {
+			grp.close(o, dataW)
+		}
+		if !nudged && cur != "" && st.n == 0 && time.Since(st.start) > 8*time.Second {
+			nudged = true
+			fmt.Fprintln(diagW)
+			fmt.Fprintln(diagW, o.paint("  提示：已跟随 8 秒，还没有「执行完成」的语句。若你确实点了界面，按顺序核对：", clrYellow))
+			fmt.Fprintln(diagW, "        ① sqllog.ini 的 MIN_EXEC_TIME 是否为 0（大于 0 时快语句不写执行完成行）")
+			fmt.Fprintln(diagW, "        ② dm.ini 的 SVR_LOG 是否为 1（SQL 日志总开关）")
+			fmt.Fprintln(diagW, "        ③ 用 --all 连准备阶段的 [ORA] 行一起看")
+			fmt.Fprintln(diagW)
+		}
+	}
+}
+
+// ══════════════════════════════════════════════ 自动定位日志目录（V2.14）
+//
+// 目标：`dmsqlq watch -a manager.exe` 就能跑，不用记路径。
+// 思路：DM 的 SQL 日志目录写在 <数据目录>/sqllog.ini 的 FILE_PATH 里，
+//       而 <数据目录> 一定是某个 DM 安装目录下的 data/<实例>/。
+//       所以「扫 DM 安装目录 → 找 sqllog.ini → 取 FILE_PATH → 解析成绝对路径」。
+
+type watchCand struct {
+	dir    string
+	why    string
+	newest int64 // 目录里 dmsql_*.log 的最新 mtime（Unix 秒）
+	count  int
+}
+
+func (c watchCand) ok() bool { return c.dir != "" && c.count > 0 }
+
+// watchLoc 定位结果
+type watchLoc struct {
+	dir   string
+	why   string
+	ini   string // 找到的 sqllog.ini（可能为空）
+	hints []string
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+func isDirP(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+// scanForDmsql 看一个目录里有没有 dmsql_*.log
+func scanForDmsql(dir, why string) watchCand {
+	c := watchCand{dir: filepath.Clean(dir), why: why}
+	ents, err := os.ReadDir(c.dir)
+	if err != nil {
+		return c
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasPrefix(n, "dmsql_") || !strings.HasSuffix(n, ".log") {
+			continue
+		}
+		c.count++
+		if fi, err := e.Info(); err == nil {
+			if t := fi.ModTime().Unix(); t > c.newest {
+				c.newest = t
+			}
+		}
+	}
+	return c
+}
+
+// candFromSqllogIni 读 sqllog.ini 的 FILE_PATH，解析成真实的日志目录。
+//
+// 🩸 相对路径的基准不是 dm.ini 所在目录，而是「dmserver 的工作目录」（通常 <安装目录>/bin）。
+// 手册原文：FILE_PATH「缺省生成在 DM 安装目录的 LOG 子目录下面」，而默认值正是 `../LOG` ——
+// 只有在 <安装目录>/bin 下解析才会落在 <安装目录>/LOG。本机实测也是这个结论
+// （sqllog.ini 在 D:\dmdbms\data\DAMENG，FILE_PATH=..\log，实际落在 D:\dmdbms\log）。
+//
+// 但实际部署里 bin 的位置不固定（数据目录可能在安装目录之外，如 133 的
+// /home/dmdba/dmdata/DAMENG），所以这里**逐个试基准**：取第一个解析出来真实存在的目录；
+// 若其中还有 dmsql_*.log 就更优先。
+func candFromSqllogIni(iniPath string) (watchCand, bool) {
+	b, err := os.ReadFile(iniPath)
+	if err != nil {
+		return watchCand{}, false
+	}
+	fp := ""
+	for _, ln := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || t[0] == '#' || t[0] == ';' || t[0] == '[' {
+			continue
+		}
+		i := strings.IndexByte(t, '=')
+		if i <= 0 {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(t[:i])) != "FILE_PATH" {
+			continue
+		}
+		v := strings.TrimSpace(t[i+1:])
+		if j := strings.IndexAny(v, "#\t "); j >= 0 {
+			v = strings.TrimSpace(v[:j])
+		}
+		if v != "" {
+			fp = v
+			break
+		}
+	}
+	if fp == "" {
+		return watchCand{}, false
+	}
+
+	why := "sqllog.ini 的 FILE_PATH（" + iniPath + "）"
+	if filepath.IsAbs(fp) {
+		c := scanForDmsql(fp, why)
+		if !c.ok() && isDirP(fp) {
+			c = watchCand{dir: filepath.Clean(fp), count: 1,
+				why: why[:strings.LastIndex(why, "（")] + "（" + iniPath + "，目录暂空）"}
+		}
+		return c, true
+	}
+
+	// 逐个试基准：ini 所在目录、它的各级祖先、各祖先下的 bin、以及已知 DM 安装根
+	base := filepath.Dir(iniPath)
+	bases := []string{base}
+	d := base
+	for i := 0; i < 4; i++ {
+		bases = append(bases, filepath.Join(d, "bin"))
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+		bases = append(bases, d)
+	}
+	for _, r := range dmRoots() {
+		bases = append(bases, r.path, filepath.Join(r.path, "bin"))
+	}
+
+	var empty watchCand
+	for _, b := range bases {
+		p := filepath.Join(b, fp)
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if c := scanForDmsql(p, why); c.ok() {
+			return c, true
+		}
+		if empty.dir == "" && isDirP(p) {
+			empty = watchCand{dir: filepath.Clean(p), count: 1,
+				why: why[:strings.LastIndex(why, "（")] + "（" + iniPath + "，目录暂空）"}
+		}
+	}
+	if empty.dir != "" {
+		return empty, true
+	}
+	return watchCand{}, true
+}
+
+// dmRootSpec 一个待扫描的根目录 + 扫描深度
+type dmRootSpec struct {
+	path  string
+	depth int
+}
+
+// dmRoots 列出「DM 装在哪」的常见位置。
+// 注意：**绝不**把盘符根/家目录本身当根去递归 —— 那会扫到几千个目录。
+func dmRoots() []dmRootSpec {
+	var out []dmRootSpec
+	seen := map[string]bool{}
+	add := func(p string, depth int) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if !isDirP(p) {
+			return
+		}
+		k := strings.ToLower(p)
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, dmRootSpec{p, depth})
+	}
+	names := []string{"dmdbms", "dm8", "dameng", "dmdata", "DM"}
+	if runtime.GOOS == "windows" {
+		for _, d := range "CDEFGHIJ" {
+			for _, n := range names {
+				add(string(d)+":\\"+n, 2)
+			}
+		}
+	} else {
+		for _, b := range []string{"/opt", "/data", "/usr/local", "/dmdbms"} {
+			for _, n := range names {
+				add(filepath.Join(b, n), 2)
+			}
+		}
+		add("/dm8", 2)
+		if ents, err := os.ReadDir("/home"); err == nil {
+			for _, e := range ents {
+				if !e.IsDir() {
+					continue
+				}
+				u := filepath.Join("/home", e.Name())
+				add(filepath.Join(u, "dmdbms"), 2)
+				add(filepath.Join(u, "dmdata"), 2)
+			}
+		}
+	}
+	// 当前目录 / 可执行文件旁：只看一层（log / sqllog），不深挖
+	shallow := []string{}
+	if wd, err := os.Getwd(); err == nil {
+		shallow = append(shallow, wd, filepath.Join(wd, "log"), filepath.Join(wd, "sqllog"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		d := filepath.Dir(exe)
+		shallow = append(shallow, d, filepath.Join(d, "log"), filepath.Join(d, "sqllog"))
+	}
+	for _, d := range shallow {
+		add(d, 1)
+	}
+	return out
+}
+
+// scanOneRoot 扫一个根：它自己 + depth 层子目录，找 sqllog.ini 与 dmsql_*.log
+func scanOneRoot(r dmRootSpec) []watchCand {
+	var out []watchCand
+	dirs := []string{r.path}
+	cur := []string{r.path}
+	for lv := 0; lv < r.depth; lv++ {
+		var next []string
+		for _, p := range cur {
+			ents, err := os.ReadDir(p)
+			if err != nil {
+				continue
+			}
+			for _, e := range ents {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				next = append(next, filepath.Join(p, e.Name()))
+			}
+		}
+		dirs = append(dirs, next...)
+		cur = next
+		if len(dirs) > 400 { // 防御：异常目录结构不至于卡死
+			break
+		}
+	}
+	for _, d := range dirs {
+		if ini := filepath.Join(d, "sqllog.ini"); fileExists(ini) {
+			if c, ok := candFromSqllogIni(ini); ok {
+				out = append(out, c)
+			}
+			continue
+		}
+		if c := scanForDmsql(d, ""); c.ok() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// watchMemFile 记住上次用的目录（省得每次重扫）
+func watchMemFile() string {
+	d, err := os.UserConfigDir()
+	if err != nil || d == "" {
+		return ""
+	}
+	return filepath.Join(d, "dmsqlq", "watch-dir.txt")
+}
+
+func loadWatchDir() string {
+	p := watchMemFile()
+	if p == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func saveWatchDir(dir string) {
+	p := watchMemFile()
+	if p == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.WriteFile(p, []byte(dir+"\n"), 0o644)
+}
+
+func forgetWatchDir() {
+	if p := watchMemFile(); p != "" {
+		_ = os.Remove(p)
+	}
+}
+
+// resolveWatchDir 自动定位 SQL 日志目录。
+func resolveWatchDir() watchLoc {
+	var loc watchLoc
+	if d := strings.TrimSpace(os.Getenv("DMSQLQ_LOG_DIR")); d != "" && isDirP(d) {
+		loc.dir, loc.why = d, "环境变量 DMSQLQ_LOG_DIR"
+		return loc
+	}
+
+	var all []watchCand
+	for _, r := range dmRoots() {
+		all = append(all, scanOneRoot(r)...)
+	}
+	// 按目录去重（保留 count/newest 更大的那份，why 用先出现的）
+	byDir := map[string]int{}
+	var uniq []watchCand
+	for _, c := range all {
+		k := strings.ToLower(c.dir)
+		if i, ok := byDir[k]; ok {
+			if c.count > uniq[i].count || c.newest > uniq[i].newest {
+				keep := uniq[i].why
+				uniq[i] = c
+				if uniq[i].why == "" {
+					uniq[i].why = keep
+				}
+			}
+			continue
+		}
+		byDir[k] = len(uniq)
+		uniq = append(uniq, c)
+	}
+	sort.SliceStable(uniq, func(i, j int) bool {
+		if uniq[i].newest != uniq[j].newest {
+			return uniq[i].newest > uniq[j].newest
+		}
+		return uniq[i].count > uniq[j].count
+	})
+
+	// 记住的目录：有效就优先（稳定），但若别处明显更新则提示
+	mem := loadWatchDir()
+	pick := -1
+	if mem != "" {
+		for i := range uniq {
+			if strings.EqualFold(uniq[i].dir, mem) {
+				pick = i
+				break
+			}
+		}
+		if pick < 0 && isDirP(mem) {
+			c := scanForDmsql(mem, "记住的路径")
+			if c.ok() {
+				uniq = append(uniq, c)
+				pick = len(uniq) - 1
+			}
+		}
+	}
+	if pick < 0 && len(uniq) > 0 {
+		pick = 0
+	}
+	if pick < 0 {
+		return loc
+	}
+
+	loc.dir = uniq[pick].dir
+	if mem != "" && strings.EqualFold(uniq[pick].dir, mem) {
+		loc.why = "记住的路径（改路径用 -d 指定，或 --forget 清掉）"
+	} else {
+		loc.why = "自动定位"
+	}
+	if uniq[pick].why != "" {
+		loc.why = "自动定位 · " + uniq[pick].why
+	}
+	if ini := filepath.Join(loc.dir, "sqllog.ini"); fileExists(ini) {
+		loc.ini = ini
+	}
+	// 还有别的候选且比选中的更新 → 告诉用户
+	n := 0
+	for i := range uniq {
+		if i == pick {
+			continue
+		}
+		if uniq[i].newest > uniq[pick].newest {
+			loc.hints = append(loc.hints, fmt.Sprintf("%s（最近 %s）—— 换用加 -d",
+				uniq[i].dir, time.Unix(uniq[i].newest, 0).Format("01-02 15:04")))
+			n++
+			if n >= 3 {
+				break
+			}
+		}
+	}
+	return loc
+}
+
+func printWatchPaths(loc watchLoc) {
+	w := os.Stdout
+	fmt.Fprintln(w, "自动定位找到的 SQL 日志目录候选（按最近写过日志排序）：")
+	fmt.Fprintln(w)
+	if loc.dir != "" {
+		fmt.Fprintf(w, "  ★ 本次会选   %s\n", loc.dir)
+	}
+	sel := loc.dir
+	var all []watchCand
+	for _, r := range dmRoots() {
+		all = append(all, scanOneRoot(r)...)
+	}
+	seen := map[string]bool{}
+	rows := []watchCand{}
+	for _, c := range all {
+		k := strings.ToLower(c.dir)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		rows = append(rows, c)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].newest != rows[j].newest {
+			return rows[i].newest > rows[j].newest
+		}
+		return rows[i].count > rows[j].count
+	})
+	if mem := loadWatchDir(); mem != "" {
+		fmt.Fprintf(w, "  记住的路径   %s\n", mem)
+	}
+	fmt.Fprintf(w, "  %-44s %-6s %-8s %s\n", "目录", "日志数", "最近写入", "来源")
+	fmt.Fprintf(w, "  %s %s %s %s\n", strings.Repeat("─", 44), "──────", "────────", strings.Repeat("─", 30))
+	shown := 0
+	for _, c := range rows {
+		if shown >= 12 {
+			fmt.Fprintf(w, "  …另有 %d 个\n", len(rows)-shown)
+			break
+		}
+		mark := " "
+		if sel != "" && strings.EqualFold(c.dir, sel) {
+			mark = "★"
+		}
+		last := "-"
+		if c.newest > 0 {
+			last = time.Unix(c.newest, 0).Format("01-02 15:04")
+		}
+		why := c.why
+		if why == "" {
+			why = "目录里有 dmsql_*.log"
+		}
+		fmt.Fprintf(w, "  %s %-43s %-8d %-10s %s\n", mark, clip(c.dir, 43), c.count, last, clip(why, 60))
+		shown++
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(w, "  （没找到。可用 -d 指定，或设 DMSQLQ_LOG_DIR）")
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "指定方式：dmsqlq watch -d <目录>  或  dmsqlq watch \"<目录>\"")
+}
+
+// ══════════════════════════════════════════════ 连库（体检 / 切同步刷盘）
+//
+// 不引第三方驱动：改用 DM 自带的 disql。口令走 stdin（/NOLOG + conn），
+// 不进命令行 —— 否则会出现在进程列表里。
+
+type dmProbe struct {
+	disql    string
+	host     string // 实例地址（-H/--host），默认 127.0.0.1；还原脚本要用它
+	conn     string
+	mode     string // V$DM_SQLLOG_CONFIG 报出的模式名（可能是 <DEFAULT>）
+	iniMode  string // sqllog.ini 里的段名（如 SLOG_ALL），仅作候选
+	prefix   string // SP_SET_SQLLOG_INI 实测生效的写法前缀："[模式]" 或 ""（不带模式名）
+	prefixOK bool   // prefix 是否已经验证过（还原时优先沿用）
+}
+
+// dmqMark 结果行的唯一标记。
+//
+// 🩸 disql 会把输入的 SQL 原样回显到输出里 —— 如果标记直接写在 SQL 文本中，
+// 回显行也会命中，解析出来的「值」就变成 SQL 片段（实测踩过）。
+// 所以 SQL 里把标记拆成两个字符串常量拼接：文本中不存在连续标记，只有结果行才有。
+const dmqMark = "##DMQ7F3A##"
+
+func dmqSel(v string) string { return "'##DMQ'||'7F3A##'||" + v }
+
+type syncRestore struct {
+	mode   string // 模式名（仅用于提示）
+	prefix string // 实际生效的写法前缀（还原时照用）
+	orig   string
+	script string
+	done   bool
+}
+
+// findDisqlNear 从「数据目录 / DM 安装根」附近找 disql
+func findDisqlNear(loc watchLoc) string {
+	bin := "disql"
+	if runtime.GOOS == "windows" {
+		bin = "disql.exe"
+	}
+	var cands []string
+	if v := strings.TrimSpace(os.Getenv("DMSQLQ_DISQL")); v != "" {
+		cands = append(cands, v)
+	}
+	starts := []string{}
+	if loc.ini != "" {
+		starts = append(starts, filepath.Dir(loc.ini))
+	}
+	if loc.dir != "" {
+		starts = append(starts, loc.dir)
+	}
+	for _, st := range starts {
+		d := st
+		for i := 0; i < 4 && d != ""; i++ { // 往上找 4 层，每层试 bin/
+			cands = append(cands, filepath.Join(d, "bin", bin))
+			parent := filepath.Dir(d)
+			if parent == d {
+				break
+			}
+			d = parent
+		}
+	}
+	for _, r := range dmRoots() {
+		cands = append(cands, filepath.Join(r.path, "bin", bin))
+	}
+	if p, err := exec.LookPath(bin); err == nil {
+		cands = append(cands, p)
+	}
+	for _, c := range cands {
+		if fileExists(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+// dmIniPort 从数据目录的 dm.ini 读 PORT_NUM
+func dmIniPort(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "dm.ini"))
+	if err != nil {
+		return "5236"
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(ln)
+		i := strings.IndexByte(t, '=')
+		if i <= 0 {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(t[:i])) != "PORT_NUM" {
+			continue
+		}
+		v := strings.TrimSpace(t[i+1:])
+		if j := strings.IndexAny(v, "#\t "); j >= 0 {
+			v = strings.TrimSpace(v[:j])
+		}
+		if v != "" {
+			return v
+		}
+	}
+	return "5236"
+}
+
+// isLocalHost 判断实例地址是否指向本机。
+//
+// 判据只认回环地址与常见的本机别名 —— 不解析真实网卡 IP：
+//
+//	· 从 WSL 连 Windows 本机时，给的是「Windows 主机 IP」（如 172.20.240.1），
+//	  从工具视角看它**就是远端**，按远端处理（拒绝改动配置）才是正确取舍；
+//	· localhost / 127.x / ::1 / 空 都算本机。
+func isLocalHost(h string) bool {
+	h = strings.ToLower(strings.TrimSpace(h))
+	switch h {
+	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	}
+	if strings.HasPrefix(h, "127.") {
+		return true
+	}
+	return false
+}
+
+func openDMProbe(loc watchLoc, pass, host, portArg string) (*dmProbe, error) {
+	d := findDisqlNear(loc)
+	if d == "" {
+		return nil, errors.New("没找到 disql（可用环境变量 DMSQLQ_DISQL 指定完整路径）")
+	}
+	dataDir := ""
+	if loc.ini != "" {
+		dataDir = filepath.Dir(loc.ini)
+	} else {
+		dataDir = loc.dir
+	}
+	// 端口优先级：命令行 -P > dm.ini 的 PORT_NUM > 5236
+	port := strings.TrimSpace(portArg)
+	if port == "" {
+		port = dmIniPort(dataDir)
+	}
+	// 地址优先级：命令行 -H > $DM_HOST > 127.0.0.1
+	if host == "" {
+		host = strings.TrimSpace(os.Getenv("DM_HOST"))
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	p := &dmProbe{disql: d, host: host, conn: fmt.Sprintf("SYSDBA/%s@%s:%s", pass, host, port)}
+	// 🩸 远端库不能沿用本机的 dm.ini 端口兜底 —— 若用户没给 -P 且 dm.ini 又不在手边，
+	//    5236 只是假定值；连不上时提示用 -P 指定。
+	if loc.ini != "" {
+		p.iniMode = sqllogMode(loc.ini)
+	}
+	// 模式名以 V$DM_SQLLOG_CONFIG **实际报的**为准 —— 它不等于 sqllog.ini 里的段名。
+	// 🩸 本机实测：报的是 <DEFAULT>，而文件里写的是 [SLOG_ALL]；
+	//    用 [SLOG_ALL] 只改到磁盘、内存不生效，必须用「不带模式名」才真的生效。
+	rows, err := p.query("select " + dmqSel("MODE_NAME||'|'||NVL(PARA_VALUE,'')") +
+		" from V$DM_SQLLOG_CONFIG where PARA_NAME='ASYNC_FLUSH';")
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("V$DM_SQLLOG_CONFIG 里没有 ASYNC_FLUSH 行")
+	}
+	if i := strings.IndexByte(rows[0], '|'); i >= 0 {
+		p.mode = strings.TrimSpace(rows[0][:i])
+	}
+	return p, nil
+}
+
+// sqllogMode 取 sqllog.ini 里「含 ASYNC_FLUSH 的那一段」的段名（仅作候选）
+func sqllogMode(iniPath string) string {
+	b, err := os.ReadFile(iniPath)
+	if err != nil {
+		return ""
+	}
+	cur := ""
+	for _, ln := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || t[0] == '#' || t[0] == ';' {
+			continue
+		}
+		if t[0] == '[' {
+			if j := strings.IndexByte(t, ']'); j > 0 {
+				cur = t[1:j]
+			}
+			continue
+		}
+		i := strings.IndexByte(t, '=')
+		if i <= 0 {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(t[:i])) == "ASYNC_FLUSH" {
+			return cur
+		}
+	}
+	return ""
+}
+
+// prefixCands SP_SET_SQLLOG_INI 的候选写法，按「先可信」排序。
+// 已验证过的写法排最前；正常模式名带 [模式]；否则/其次用不带模式名（全局配置区）。
+func (p *dmProbe) prefixCands() []string {
+	var out []string
+	add := func(s string) {
+		for _, x := range out {
+			if x == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	if p.prefixOK {
+		add(p.prefix)
+	}
+	if p.mode != "" && !strings.HasPrefix(p.mode, "<") {
+		add("[" + p.mode + "]")
+	}
+	add("")
+	if p.iniMode != "" && !strings.EqualFold(p.iniMode, p.mode) {
+		add("[" + p.iniMode + "]")
+	}
+	return out
+}
+
+func (p *dmProbe) close() {}
+
+// query 跑一条 SQL，返回所有含 ##DMQ## 标记的值
+func (p *dmProbe) query(sql string) ([]string, error) {
+	cmd := exec.Command(p.disql, "/NOLOG")
+	cmd.Stdin = strings.NewReader("conn " + p.conn + "\nset echo off\n" + sql + "\nexit\n")
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	env := os.Environ()
+	if runtime.GOOS != "windows" {
+		env = append(env, "LD_LIBRARY_PATH="+filepath.Dir(p.disql))
+	}
+	cmd.Env = env
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		return nil, errors.New("disql 超时（20s）")
+	case <-done:
+	}
+	out := buf.String()
+	if os.Getenv("DMSQLQ_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "---- disql 原始输出 ----\n%s\n------------------------\n", out)
+	}
+	var vals []string
+	for _, ln := range strings.Split(out, "\n") {
+		i := strings.Index(ln, dmqMark)
+		if i < 0 {
+			continue
+		}
+		v := ln[i+len(dmqMark):]
+		// 值后面可能跟着 disql 的提示符/空格，取到行尾再清理
+		v = strings.TrimRight(v, " \t\r")
+		if j := strings.Index(v, "SQL>"); j >= 0 {
+			v = strings.TrimSpace(v[:j])
+		}
+		vals = append(vals, v)
+	}
+	if len(vals) == 0 {
+		if strings.Contains(out, "用户名或密码错误") || strings.Contains(out, "invalid password") {
+			return nil, errors.New("登录失败（口令不对？）")
+		}
+		return nil, errors.New("查询无结果（设 DMSQLQ_DEBUG=1 可看 disql 原始输出）")
+	}
+	return vals, nil
+}
+
+func (p *dmProbe) cfgValue(name string) string {
+	rows, err := p.query("select " + dmqSel("NVL(PARA_VALUE,'')") +
+		" from V$DM_SQLLOG_CONFIG where PARA_NAME='" + name + "';")
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	return rows[0]
+}
+
+// report 只读体检：把采集侧的四个关键项列出来
+func (p *dmProbe) report() []string {
+	var out []string
+	line := "体检    "
+	if p.mode != "" {
+		line += "模式=" + p.mode + " · "
+	}
+	if v := p.cfgValue("SQL_TRACE_MASK"); v != "" {
+		line += "掩码=" + v
+		if !hasBit(v, "27") {
+			line += "（不含位 27，拿不到被 MIN_EXEC_TIME 滤掉的语句）"
+		}
+	} else {
+		line += "掩码=读不到"
+	}
+	if v := p.cfgValue("MIN_EXEC_TIME"); v != "" {
+		line += " · MIN_EXEC_TIME=" + v
+		if v != "0" {
+			line += "（>0：快语句不写「执行完成行」，可用 --all 看 [ORA]）"
+		}
+	}
+	if v := p.cfgValue("ASYNC_FLUSH"); v != "" {
+		line += " · ASYNC_FLUSH=" + v
+		if v == "1" {
+			line += "（异步刷盘；要最实时用 -Y 临时切同步）"
+		}
+	}
+	out = append(out, line)
+	if sv := p.iniValue("SVR_LOG"); sv != "" && sv != "1" && sv != "2" && sv != "3" {
+		out = append(out, "体检    ⚠️ dm.ini 的 SVR_LOG="+sv+"（0=关闭）—— SQL 日志总开关没开，watch 看不到东西")
+	}
+	return out
+}
+
+func (p *dmProbe) iniValue(name string) string {
+	rows, err := p.query("select " + dmqSel("NVL(PARA_VALUE,'')") +
+		" from V$DM_INI where PARA_NAME='" + name + "';")
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	return rows[0]
+}
+
+// hasBit 判断「2:3:25:28」这种掩码串里有没有某一位
+func hasBit(mask, bit string) bool {
+	for _, p := range strings.Split(mask, ":") {
+		if strings.TrimSpace(p) == bit {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *dmProbe) setAsyncFlush(v string) error {
+	_, err := p.query("SP_SET_SQLLOG_INI('" + p.prefix + "ASYNC_FLUSH=" + v +
+		"');SP_REFRESH_SVR_LOG_CONFIG();select " + dmqSel("'ok'") + " as x;")
+	return err
+}
+
+// applyFlush 设置 ASYNC_FLUSH，逐个候选写法试到「回读一致」为止，并记下真正生效的那个。
+// 🩸 只看「过程执行成功」不够：本机实测 [SLOG_ALL] 写法过程成功、磁盘也改了，但内存值没变。
+func (p *dmProbe) applyFlush(v string) error {
+	var last string
+	for _, pre := range p.prefixCands() {
+		p.prefix, p.prefixOK = pre, false
+		_ = p.setAsyncFlush(v)
+		if now := p.cfgValue("ASYNC_FLUSH"); now == v {
+			p.prefixOK = true
+			return nil
+		} else {
+			last = now
+		}
+	}
+	return fmt.Errorf("改不动 ASYNC_FLUSH：回读是 %s，期望 %s —— 模式名 %s 与「不带模式名」两种写法都试过了",
+		last, v, p.mode)
+}
+
+// switchToSync 把 ASYNC_FLUSH 从 1 改成 0（原本就是 0 则不动）。
+//
+// 🩸 顺序很重要：**先写还原脚本、再动数据库**。反过来会出现「已改成功、
+// 但还没登记还原就出错退出」—— 库被留在同步刷盘上（实测踩过）。
+// 回读校验失败时也立即回滚，绝不把改动留在库里。
+func (p *dmProbe) switchToSync() (*syncRestore, error) {
+	orig := p.cfgValue("ASYNC_FLUSH")
+	if orig == "" {
+		return nil, errors.New("读不到 ASYNC_FLUSH（V$DM_SQLLOG_CONFIG 没这一项？）")
+	}
+	if orig == "0" {
+		return nil, nil // 本来就是同步刷盘，不需要动，也不需要还原
+	}
+	r := &syncRestore{mode: p.mode, orig: orig}
+	// ★ 先把还原脚本落盘（用首选写法），再动数据库；等确定生效写法后再改写一次
+	cands := p.prefixCands()
+	if len(cands) > 0 {
+		r.prefix = cands[0]
+	}
+	r.script = writeRestoreScript(p, r)
+	if err := p.applyFlush("0"); err != nil {
+		rb := p.applyFlush(orig) // 可能改了一半，尽量回滚
+		if rb != nil {
+			return nil, fmt.Errorf("%v；且回滚也失败：%v —— 请执行 %s", err, rb, r.script)
+		}
+		return nil, fmt.Errorf("%v（已回滚为 %s）", err, orig)
+	}
+	r.prefix = p.prefix
+	r.script = writeRestoreScript(p, r) // 用实测生效的写法改写
+	return r, nil
+}
+
+func (p *dmProbe) restoreSync(r *syncRestore) error {
+	if r == nil || r.done {
+		return nil
+	}
+	p.prefix, p.prefixOK = r.prefix, true
+	if err := p.applyFlush(r.orig); err != nil {
+		return err
+	}
+	now := p.cfgValue("ASYNC_FLUSH")
+	if now != r.orig {
+		return fmt.Errorf("回读是 %s，期望 %s", now, r.orig)
+	}
+	r.done = true
+	return nil
+}
+
+// restoreNow 供退出路径调用（无库/无还原登记时静默）
+func restoreNow(db *dmProbe, r **syncRestore) {
+	if db == nil || *r == nil {
+		return
+	}
+	rr := *r
+	if rr.done {
+		return
+	}
+	if err := db.restoreSync(rr); err != nil {
+		fmt.Fprintf(os.Stdout, "\n  ⚠️ 还原 ASYNC_FLUSH 失败：%v\n     请手工执行：%s\n", err, rr.script)
+		return
+	}
+	fmt.Fprintf(os.Stdout, "\n  已还原 SQL 日志刷盘方式：ASYNC_FLUSH=%s ✓\n", rr.orig)
+}
+
+// writeRestoreScript 写一份「没有口令」的手工还原脚本，防强杀
+func writeRestoreScript(p *dmProbe, r *syncRestore) string {
+	pth := filepath.Join(os.TempDir(), "dmsqlq_restore_async_flush.sql")
+	host := p.host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := ""
+	if i := strings.LastIndexByte(p.conn, ':'); i > 0 {
+		port = p.conn[i+1:]
+	}
+	if port == "" {
+		port = "5236"
+	}
+	txt := "-- dmsqlq watch 自动生成：手工还原 SQL 日志刷盘方式\n" +
+		"--（日志模式 " + r.mode + "，写法 '" + r.prefix + "ASYNC_FLUSH=" + r.orig + "'）\n" +
+		"-- 用途：万一 dmsqlq 被强杀、没来得及自动还原，手工跑这个即可。\n" +
+		"-- 用法：把下面的 <口令> 换成 SYSDBA 口令，然后\n" +
+		"--        disql /NOLOG < " + pth + "\n" +
+		"conn SYSDBA/<口令>@" + host + ":" + port + "\n" +
+		"SP_SET_SQLLOG_INI('" + r.prefix + "ASYNC_FLUSH=" + r.orig + "');\n" +
+		"SP_REFRESH_SVR_LOG_CONFIG();\n" +
+		"select PARA_NAME, PARA_VALUE from V$DM_SQLLOG_CONFIG where PARA_NAME='ASYNC_FLUSH';\n" +
+		"exit\n"
+	if err := os.WriteFile(pth, []byte(txt), 0o644); err != nil {
+		return "(写还原脚本失败：" + err.Error() + ")"
+	}
+	return pth
 }

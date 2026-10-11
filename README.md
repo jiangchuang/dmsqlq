@@ -5,7 +5,7 @@
 
 **单个可执行文件 · 不连数据库 · 不建表 · 不装运行时 · 不联网 · GB 级日志秒级扫完。**
 
-当前版本：**V2.7**（2026-10-02）
+当前版本：**V2.22**（2026-10-11）
 
 ---
 
@@ -13,11 +13,11 @@
 
 | 平台 | 文件 | 用法 |
 |---|---|---|
-| Windows x64 | [`V2.7/dmsqlq.exe`](V2.7/dmsqlq.exe) | 双击，或 `dmsqlq.exe --help` |
-| Linux x86_64 | [`V2.7/dmsqlq_linux_x64`](V2.7/dmsqlq_linux_x64) | `chmod +x dmsqlq_linux_x64 && ./dmsqlq_linux_x64 --help` |
-| Linux arm64（鲲鹏/飞腾） | [`V2.7/dmsqlq_linux_arm64`](V2.7/dmsqlq_linux_arm64) | 同上 |
+| Windows x64 | [`V2.22/dmsqlq.exe`](V2.22/dmsqlq.exe) | 双击，或 `dmsqlq.exe --help` |
+| Linux x86_64 | [`V2.22/dmsqlq_linux_x64`](V2.22/dmsqlq_linux_x64) | `chmod +x dmsqlq_linux_x64 && ./dmsqlq_linux_x64 --help` |
+| Linux arm64（鲲鹏/飞腾） | [`V2.22/dmsqlq_linux_arm64`](V2.22/dmsqlq_linux_arm64) | 同上 |
 
-校验值见 [`V2.7/CHECKSUMS_V2.7.txt`](V2.7/CHECKSUMS_V2.7.txt)。
+校验值见 [`V2.22/CHECKSUMS_V2.22.txt`](V2.22/CHECKSUMS_V2.22.txt)。
 
 ---
 
@@ -32,6 +32,10 @@ dmsqlq . -s -Q                  同上，但不自动打开浏览器（批处理
 dmsqlq . -S                     只在终端扫一眼统计，不出文件
 dmsqlq . -B 20 -o slow.sql      导出最慢 20 条的完整 SQL
 ```
+
+> **TAB 补全（V2.22 起）**：首次以交互方式运行 dmsqlq 时会自动装好（选项与路径都能补），
+> 无需手工配置。也可 `dmsqlq --completion-install` 显式安装、`--completion-uninstall` 撤销。
+> 提示只走 stderr，不影响 `-o out.sql` 与管道输出。
 
 ---
 
@@ -64,12 +68,13 @@ dmsqlq . -B 20 -o slow.sql      导出最慢 20 条的完整 SQL
 
 | 文档 | 内容 |
 |---|---|
-| [`使用说明.md`](使用说明.md) | 面向使用的完整说明：全部参数、八个常用场景、判读口径 |
+| [`使用说明.md`](使用说明.md) | 面向使用的完整说明：全部参数、常用场景、判读口径 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 发版更新记录，按版本倒序，含每个版本的新增 / 修复 / 实测 |
 | [`设计与选型说明.md`](设计与选型说明.md) | 选型理由与实现细节 |
+| [`wsl/README.md`](wsl/README.md) | WSL 里连本机/虚拟机达梦的环境准备（watch 远程场景） |
 | [`src/dmsqlq.go`](src/dmsqlq.go) | 源码（纯 Go 标准库，无第三方依赖） |
 
-每个版本目录（如 `V2.7/`）都是自包含的回滚单元，内含该版本的二进制、说明文档与校验值。
+每个版本目录（如 `V2.22/`）都是自包含的回滚单元，内含该版本的二进制、说明文档与校验值。
 
 ---
 

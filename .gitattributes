@@ -5,6 +5,7 @@
 *.exe binary
 *.zip binary
 *.xlsx binary
+dmsqlq_linux_* binary
 
 # 🩸 CHECKSUMS 必须保持 LF
 # 若被转成 CRLF，md5sum -c 会把行尾的 \r 算进文件名，导致全部校验 FAILED open or read
