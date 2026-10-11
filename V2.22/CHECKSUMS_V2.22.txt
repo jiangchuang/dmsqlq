@@ -1,5 +1,5 @@
-a3db95ed1c29c137c2d9348d70c44843 *CHANGELOG.md
-e931946bfd0e6b0613865c91f5dc4a75 *使用说明.md
+a3db95ed1c29c137c2d9348d70c44843 *dmsqlq_V2.22_CHANGELOG.md
+e931946bfd0e6b0613865c91f5dc4a75 *dmsqlq_V2.22_使用说明.md
 62f45f14438c6ed8eca4f4726c159efe *dmsqlq.exe
 73e1a5564f638beae0039d7ccf7abfe7 *dmsqlq_linux_x64
 9bff7aba57603202b25e45ce2123817c *dmsqlq_linux_arm64
